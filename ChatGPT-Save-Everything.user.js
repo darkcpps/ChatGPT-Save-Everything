@@ -2,7 +2,7 @@
 // @name         ChatGPT One-File Archive (Account Safe)
 // @namespace    http://tampermonkey.net/
 // @version      1.3
-// @description  One TXT archive for ChatGPT chats, grouped by account label, with full auto-sync, safer delete sync, archive import, and bullet summaries.
+// @description  Archive ChatGPT chats and profile context into one local TXT file, with account-safe labels, auto-sync, and import tools.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        none
