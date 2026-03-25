@@ -37,6 +37,10 @@
   const STATUS_PULSE_MS = 420;
   const CHAT_BLOCK_SPLIT = '\n################################################################\nCHAT\n################################################################\n';
   const PROFILE_BLOCK_MARKER = '\n################################################################\nPROFILE\n################################################################\n';
+  const MEMORY_SYNC_STATUS_FRESH = 'fresh';
+  const MEMORY_SYNC_STATUS_STALE = 'stale';
+  const MEMORY_SYNC_STATUS_FAILED = 'failed';
+  const MEMORY_SYNC_STATUS_UNKNOWN = 'unknown';
 
   // ============================================================
   // Runtime state
@@ -62,6 +66,7 @@
   let importWizardData = null;
   let importInProgress = false;
   let statusPulseTimer = null;
+  let progressHideTimer = null;
   let wrapHideTimer = null;
   let showButtonHideTimer = null;
   const modalHideTimers = new WeakMap();
@@ -504,6 +509,29 @@
     return null;
   }
 
+  function normalizeMemorySyncStatus(value) {
+    const normalized = cleanText(String(value || '')).toLowerCase();
+    if (!normalized) return MEMORY_SYNC_STATUS_UNKNOWN;
+    if (normalized === MEMORY_SYNC_STATUS_FRESH) return MEMORY_SYNC_STATUS_FRESH;
+    if (normalized === MEMORY_SYNC_STATUS_STALE) return MEMORY_SYNC_STATUS_STALE;
+    if (normalized === MEMORY_SYNC_STATUS_FAILED) return MEMORY_SYNC_STATUS_FAILED;
+    if (normalized === MEMORY_SYNC_STATUS_UNKNOWN) return MEMORY_SYNC_STATUS_UNKNOWN;
+    if (normalized.includes('fresh') || normalized.includes('success') || normalized.includes('synced')) {
+      return MEMORY_SYNC_STATUS_FRESH;
+    }
+    if (normalized.includes('stale')) return MEMORY_SYNC_STATUS_STALE;
+    if (normalized.includes('fail') || normalized.includes('error')) return MEMORY_SYNC_STATUS_FAILED;
+    return MEMORY_SYNC_STATUS_UNKNOWN;
+  }
+
+  function formatMemorySyncStatus(status) {
+    const normalized = normalizeMemorySyncStatus(status);
+    if (normalized === MEMORY_SYNC_STATUS_FRESH) return 'FRESH';
+    if (normalized === MEMORY_SYNC_STATUS_STALE) return 'STALE';
+    if (normalized === MEMORY_SYNC_STATUS_FAILED) return 'FAILED';
+    return 'UNKNOWN';
+  }
+
   function pickFirstString(values) {
     for (const value of values) {
       if (typeof value === 'string' && cleanText(value)) {
@@ -939,24 +967,46 @@
     profileSyncPromise = (async () => {
       lastProfileSyncStartedAt = Date.now();
       if (!silent) setStatus(`Syncing profile for ${activeAccountLabel}...`);
+      const profileStepTotal = 5;
+      let profileStepDone = 0;
+      const profileStep = (label) => {
+        if (silent) return;
+        profileStepDone++;
+        const pct = Math.round((profileStepDone / profileStepTotal) * 100);
+        setProgress(pct, label);
+      };
+
+      if (!silent) {
+        setProgress(0, `Syncing profile for ${activeAccountLabel}...`);
+      }
+
+      const existingProfile = await dbGet(profileStorageKey(activeAccountLabel));
 
       const profile = {
         accountLabel: activeAccountLabel,
         updatedAt: new Date().toISOString(),
         customInstructions: {
-          enabled: null,
-          aboutUser: '',
-          aboutModel: '',
-          sourceUrl: ''
+          enabled: normalizeOptionalBoolean(existingProfile?.customInstructions?.enabled),
+          aboutUser: cleanText(existingProfile?.customInstructions?.aboutUser || ''),
+          aboutModel: cleanText(existingProfile?.customInstructions?.aboutModel || ''),
+          sourceUrl: cleanText(existingProfile?.customInstructions?.sourceUrl || '')
         },
         aboutYou: {
-          text: '',
-          preferredName: '',
-          occupation: '',
-          sourceUrl: ''
+          text: cleanText(existingProfile?.aboutYou?.text || ''),
+          preferredName: cleanText(existingProfile?.aboutYou?.preferredName || ''),
+          occupation: cleanText(existingProfile?.aboutYou?.occupation || ''),
+          sourceUrl: cleanText(existingProfile?.aboutYou?.sourceUrl || '')
         },
-        memories: [],
-        memoriesSourceUrl: '',
+        memories: Array.isArray(existingProfile?.memories) ? existingProfile.memories : [],
+        memoriesSourceUrl: cleanText(existingProfile?.memoriesSourceUrl || ''),
+        memoriesSyncStatus: normalizeMemorySyncStatus(
+          existingProfile?.memoriesSyncStatus ||
+          (Array.isArray(existingProfile?.memories) && existingProfile.memories.length
+            ? MEMORY_SYNC_STATUS_STALE
+            : MEMORY_SYNC_STATUS_UNKNOWN)
+        ),
+        memoriesLastSuccessfulSyncAt: cleanText(existingProfile?.memoriesLastSuccessfulSyncAt || ''),
+        memoriesLastError: cleanText(existingProfile?.memoriesLastError || ''),
         warnings: []
       };
 
@@ -965,12 +1015,14 @@
       } catch (err) {
         profile.warnings.push(`Custom instructions fetch failed: ${err?.message || err}`);
       }
+      profileStep('Custom instructions checked');
 
       try {
         profile.aboutYou = await fetchAboutYou();
       } catch (err) {
         profile.warnings.push(`About-you fetch failed: ${err?.message || err}`);
       }
+      profileStep('About-you checked');
 
       if (!profile.aboutYou.text && profile.customInstructions.aboutUser) {
         profile.aboutYou = {
@@ -985,23 +1037,40 @@
         const memoryResult = await fetchMemories();
         profile.memories = memoryResult.items;
         profile.memoriesSourceUrl = memoryResult.sourceUrl || '';
+        profile.memoriesSyncStatus = MEMORY_SYNC_STATUS_FRESH;
+        profile.memoriesLastSuccessfulSyncAt = new Date().toISOString();
+        profile.memoriesLastError = '';
       } catch (err) {
-        profile.warnings.push(`Memory fetch failed: ${err?.message || err}`);
+        const errorText = cleanText(err?.message || String(err) || 'Unknown error');
+        profile.memoriesSyncStatus = profile.memories.length
+          ? MEMORY_SYNC_STATUS_STALE
+          : MEMORY_SYNC_STATUS_FAILED;
+        profile.memoriesLastError = errorText;
+        profile.warnings.push(`Memory fetch failed: ${errorText}`);
       }
+      profileStep('Memories checked');
 
       await dbSet(profileStorageKey(activeAccountLabel), profile);
+      profileStep('Profile saved');
       await rebuildArchiveFile();
+      profileStep('Archive rebuilt');
 
       if (!silent) {
         setStatus(
-          `Profile synced: ${profile.memories.length} memories, custom instructions ` +
+          `Profile synced: ${profile.memories.length} memories (${formatMemorySyncStatus(profile.memoriesSyncStatus).toLowerCase()}), custom instructions ` +
           (profile.customInstructions.aboutUser || profile.customInstructions.aboutModel ? 'captured' : 'empty') +
           `, about-you ${profile.aboutYou.text ? 'captured' : 'empty'}`
         );
+        setProgressDone('Profile sync complete');
       }
 
       return profile;
-    })().finally(() => {
+    })().catch((err) => {
+      if (!silent) {
+        setProgressFailed('Profile sync failed');
+      }
+      throw err;
+    }).finally(() => {
       profileSyncPromise = null;
     });
 
@@ -1169,6 +1238,7 @@
       lastSyncStartedAt = Date.now();
       if (!silent) {
         setStatus(`Syncing all chats for ${activeAccountLabel}...`);
+        setProgress(1, `Syncing all chats for ${activeAccountLabel}...`);
       }
 
       try {
@@ -1176,6 +1246,7 @@
       } catch (err) {
         console.warn('Profile sync failed before chat sync:', err);
       }
+      if (!silent) setProgress(10, 'Profile sync stage done');
 
       const existingChats = await dbGetAllChats();
       const existingById = new Map(
@@ -1191,6 +1262,7 @@
         console.warn('Conversation list fetch failed, falling back to sidebar IDs:', err);
         metas = collectSidebarChatIds().map((id) => ({ id, title: '', updatedAt: null }));
       }
+      if (!silent) setProgress(18, `Loaded ${metas.length} chat metadata records`);
 
       const uniqueMetas = [];
       const seenIds = new Set();
@@ -1219,6 +1291,10 @@
       let cursor = 0;
       const workerCount = Math.max(1, Math.min(FULL_SYNC_CONCURRENCY, metasToFetch.length || 1));
 
+      if (!silent && metasToFetch.length === 0) {
+        setProgress(90, 'No out-of-date chats to fetch');
+      }
+
       const workers = Array.from({ length: workerCount }, async () => {
         while (true) {
           const index = cursor++;
@@ -1240,6 +1316,12 @@
             console.warn('Chat sync failed for', meta.id, err);
           } finally {
             processedCount++;
+            if (!silent) {
+              const progressPct = metasToFetch.length
+                ? Math.round(18 + ((processedCount / metasToFetch.length) * 72))
+                : 90;
+              setProgress(progressPct, `Chat sync progress ${processedCount}/${metasToFetch.length}`);
+            }
             if (!silent && (processedCount % 10 === 0 || processedCount === metasToFetch.length)) {
               setStatus(`Synced ${processedCount}/${metasToFetch.length} chats...`);
             }
@@ -1249,12 +1331,21 @@
 
       await Promise.all(workers);
 
+      if (!silent) setProgress(96, 'Rebuilding archive file...');
       await rebuildArchiveFile();
       if (!silent || savedCount > 0) {
         setStatus(`All-chat sync finished: ${savedCount} updated (${metasToFetch.length} checked)`);
       }
+      if (!silent) {
+        setProgressDone(`Sync complete: ${savedCount} updated`);
+      }
       return savedCount;
-    })().finally(() => {
+    })().catch((err) => {
+      if (!silent) {
+        setProgressFailed('All-chat sync failed');
+      }
+      throw err;
+    }).finally(() => {
       fullSyncPromise = null;
     });
 
@@ -1408,6 +1499,9 @@
     const customInstructionsSource = getField('Custom Instructions Source: ');
     const aboutYouSource = getField('About You Source: ');
     const memoriesSourceUrl = getField('Memories Source: ');
+    const memoriesSyncStatus = normalizeMemorySyncStatus(getField('Memories Sync Status: '));
+    const memoriesLastSuccessfulSyncRaw = getField('Memories Last Successful Sync: ');
+    const memoriesLastError = getField('Memories Last Error: ');
 
     const aboutUser = extractMarkedBlock(
       normalized,
@@ -1466,6 +1560,13 @@
         sourceUrl: aboutYouSource
       },
       memories,
+      memoriesSyncStatus: memories.length && memoriesSyncStatus === MEMORY_SYNC_STATUS_UNKNOWN
+        ? MEMORY_SYNC_STATUS_STALE
+        : memoriesSyncStatus,
+      memoriesLastSuccessfulSyncAt: Number.isFinite(Date.parse(memoriesLastSuccessfulSyncRaw))
+        ? new Date(memoriesLastSuccessfulSyncRaw).toISOString()
+        : '',
+      memoriesLastError,
       memoriesSourceUrl,
       warnings: []
     };
@@ -1971,6 +2072,12 @@
     lines.push('Custom Instructions Source: ' + (customInstructions?.sourceUrl || ''));
     lines.push('About You Source: ' + (aboutYou?.sourceUrl || ''));
     lines.push('Memories Source: ' + (profile?.memoriesSourceUrl || ''));
+    lines.push('Memories Sync Status: ' + formatMemorySyncStatus(
+      profile?.memoriesSyncStatus ||
+      (memories.length ? MEMORY_SYNC_STATUS_STALE : MEMORY_SYNC_STATUS_UNKNOWN)
+    ));
+    lines.push('Memories Last Successful Sync: ' + (profile?.memoriesLastSuccessfulSyncAt || ''));
+    lines.push('Memories Last Error: ' + (profile?.memoriesLastError || ''));
     lines.push('<<CUSTOM_INSTRUCTIONS_ABOUT_USER>>');
     lines.push(customInstructions?.aboutUser || '');
     lines.push('<<END_CUSTOM_INSTRUCTIONS_ABOUT_USER>>');
@@ -2522,19 +2629,26 @@
   }
 
   async function loadImportWizardArchiveFile() {
-    const selected = await openArchiveTextFile();
-    const parsed = parseArchiveText(selected.text);
-    const accounts = buildArchiveImportAccounts(parsed);
+    setProgress(0, 'Loading import archive...', { indeterminate: true });
+    try {
+      const selected = await openArchiveTextFile();
+      const parsed = parseArchiveText(selected.text);
+      const accounts = buildArchiveImportAccounts(parsed);
 
-    importWizardData = {
-      sourceFileName: selected.name,
-      parsed,
-      accounts,
-      selectedLabel: accounts[0]?.label || ''
-    };
+      importWizardData = {
+        sourceFileName: selected.name,
+        parsed,
+        accounts,
+        selectedLabel: accounts[0]?.label || ''
+      };
 
-    updateImportWizardUi();
-    setStatus(`Import archive loaded: ${selected.name}`);
+      updateImportWizardUi();
+      setStatus(`Import archive loaded: ${selected.name}`);
+      setProgressDone('Import archive loaded');
+    } catch (err) {
+      setProgressFailed('Import archive load failed');
+      throw err;
+    }
   }
 
   async function importWizardApplyCustomInstructions() {
@@ -2545,9 +2659,16 @@
       throw new Error('No custom instructions/about-you found for selected account');
     }
 
-    setStatus(`Applying custom instructions from ${selected.label}...`);
-    const result = await applyCustomInstructionsToCurrentAccount(customInstructions, aboutYouText);
-    setStatus(`Custom instructions applied (${result.method})`);
+    setProgress(0, `Applying custom instructions from ${selected.label}...`, { indeterminate: true });
+    try {
+      setStatus(`Applying custom instructions from ${selected.label}...`);
+      const result = await applyCustomInstructionsToCurrentAccount(customInstructions, aboutYouText);
+      setStatus(`Custom instructions applied (${result.method})`);
+      setProgressDone('Custom instructions applied');
+    } catch (err) {
+      setProgressFailed('Custom instructions step failed');
+      throw err;
+    }
   }
 
   async function importWizardImportChats() {
@@ -2568,12 +2689,18 @@
     updateImportWizardUi();
     try {
       for (let i = 0; i < chunks.length; i++) {
+        const pct = Math.round((i / chunks.length) * 100);
+        setProgress(pct, `Importing chats chunk ${i + 1}/${chunks.length}`);
         setStatus(`Importing chats chunk ${i + 1}/${chunks.length}...`);
         await sendComposerMessage(chunks[i]);
         await sleep(500);
         await waitForComposerAvailability();
       }
       setStatus(`Chat import complete: ${selected.chats.length} chats imported`);
+      setProgressDone(`Import complete: ${selected.chats.length} chats`);
+    } catch (err) {
+      setProgressFailed('Chat import failed');
+      throw err;
     } finally {
       importInProgress = false;
       updateImportWizardUi();
@@ -2690,6 +2817,94 @@
     if (!el) return;
     el.textContent = msg;
     setStatusPulse(el);
+  }
+
+  function setProgressBarVisibility(visible) {
+    const bar = document.getElementById('cgpt-archive-progress');
+    if (!bar) return;
+    if (visible) {
+      bar.classList.add('cgpt-progress-visible');
+    } else {
+      bar.classList.remove('cgpt-progress-visible');
+    }
+  }
+
+  function setProgressLabel(label) {
+    const el = document.getElementById('cgpt-archive-progress-label');
+    if (!el) return;
+    el.textContent = cleanText(label || '');
+  }
+
+  function setProgress(value, label = '', options = {}) {
+    const {
+      indeterminate = false,
+      state = 'normal'
+    } = options;
+
+    const fill = document.getElementById('cgpt-archive-progress-fill');
+    const bar = document.getElementById('cgpt-archive-progress');
+    if (!fill || !bar) return;
+
+    if (progressHideTimer) {
+      clearTimeout(progressHideTimer);
+      progressHideTimer = null;
+    }
+
+    setProgressBarVisibility(true);
+    setProgressLabel(label);
+
+    bar.classList.toggle('cgpt-progress-indeterminate', indeterminate);
+    bar.classList.toggle('cgpt-progress-success', state === 'success');
+    bar.classList.toggle('cgpt-progress-error', state === 'error');
+
+    if (indeterminate) {
+      fill.style.width = '36%';
+      return;
+    }
+
+    const numeric = Number(value);
+    const clamped = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) : 0;
+    fill.style.width = `${clamped}%`;
+  }
+
+  function hideProgress(delayMs = 0) {
+    const fill = document.getElementById('cgpt-archive-progress-fill');
+    const bar = document.getElementById('cgpt-archive-progress');
+    if (!fill || !bar) return;
+
+    if (progressHideTimer) {
+      clearTimeout(progressHideTimer);
+      progressHideTimer = null;
+    }
+
+    const close = () => {
+      setProgressBarVisibility(false);
+      bar.classList.remove('cgpt-progress-indeterminate');
+      bar.classList.remove('cgpt-progress-success');
+      bar.classList.remove('cgpt-progress-error');
+      setProgressLabel('');
+      fill.style.width = '0%';
+    };
+
+    if (delayMs <= 0) {
+      close();
+      return;
+    }
+
+    progressHideTimer = setTimeout(() => {
+      close();
+      progressHideTimer = null;
+    }, delayMs);
+  }
+
+  function setProgressDone(label = 'Done') {
+    setProgress(100, label, { state: 'success' });
+    hideProgress(1400);
+  }
+
+  function setProgressFailed(label = 'Failed') {
+    setProgress(100, label, { state: 'error' });
+    hideProgress(2200);
   }
 
   function isUiHidden() {
@@ -2821,8 +3036,51 @@
         background: rgba(0,0,0,0.2); padding: 6px; border-radius: 6px;
         transition: background-color 180ms var(--cgpt-ease-fast), color 180ms var(--cgpt-ease-fast), transform 180ms var(--cgpt-ease-fast);
       }
+      #cgpt-archive-progress {
+        display: none;
+        background: rgba(0,0,0,0.2);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 8px;
+        padding: 6px 8px;
+      }
+      #cgpt-archive-progress.cgpt-progress-visible { display: block; }
+      #cgpt-archive-progress-track {
+        width: 100%;
+        height: 7px;
+        background: rgba(255,255,255,0.08);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      #cgpt-archive-progress-fill {
+        height: 100%;
+        width: 0%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #10a37f, #22c55e);
+        transition: width 220ms var(--cgpt-ease-fast), background 180ms var(--cgpt-ease-fast), transform 180ms var(--cgpt-ease-fast);
+      }
+      #cgpt-archive-progress.cgpt-progress-indeterminate #cgpt-archive-progress-fill {
+        width: 36%;
+        animation: cgpt-progress-indeterminate 1.15s linear infinite;
+      }
+      #cgpt-archive-progress.cgpt-progress-success #cgpt-archive-progress-fill {
+        background: linear-gradient(90deg, #22c55e, #34d399);
+      }
+      #cgpt-archive-progress.cgpt-progress-error #cgpt-archive-progress-fill {
+        background: linear-gradient(90deg, #ef4444, #f97316);
+      }
+      #cgpt-archive-progress-label {
+        font-size: 11px;
+        color: #cbd5e1;
+        text-align: right;
+        margin-top: 5px;
+        min-height: 14px;
+      }
       #cgpt-archive-status.cgpt-status-updated {
         animation: cgpt-status-pulse ${STATUS_PULSE_MS}ms var(--cgpt-ease-out);
+      }
+      @keyframes cgpt-progress-indeterminate {
+        0% { transform: translateX(-120%); }
+        100% { transform: translateX(320%); }
       }
       @keyframes cgpt-status-pulse {
         0% { transform: translate3d(0, 0, 0) scale(1); background: rgba(0,0,0,0.2); color: #9ca3af; }
@@ -2935,6 +3193,7 @@
         .cgpt-guide-panel,
         .cgpt-import-panel,
         .cgpt-guide-close,
+        #cgpt-archive-progress-fill,
         #cgpt-archive-status {
           transition-duration: 0.01ms !important;
           animation-duration: 0.01ms !important;
@@ -3190,8 +3449,15 @@
     row1.className = 'cgpt-btn-row';
     const setAccountBtn = createBtn('Set Account', () => promptForAccountLabel());
     const chooseFileBtn = createBtn('Choose File', async () => {
-      try { await chooseArchiveFile(); await rebuildArchiveFile(); }
-      catch (err) { setStatus('Could not choose file'); }
+      setProgress(0, 'Choosing archive file...', { indeterminate: true });
+      try {
+        await chooseArchiveFile();
+        await rebuildArchiveFile();
+        setProgressDone('Archive file ready');
+      } catch (err) {
+        setStatus('Could not choose file');
+        setProgressFailed('Choose file failed');
+      }
     });
     row1.appendChild(setAccountBtn);
     row1.appendChild(chooseFileBtn);
@@ -3199,7 +3465,14 @@
     const row2 = document.createElement('div');
     row2.className = 'cgpt-btn-row';
     const saveBtn = createBtn('Save Now', async () => {
-      try { await captureCurrentChat(); } catch (err) { setStatus('Save failed'); }
+      setProgress(0, 'Saving current chat...', { indeterminate: true });
+      try {
+        await captureCurrentChat();
+        setProgressDone('Chat saved');
+      } catch (err) {
+        setStatus('Save failed');
+        setProgressFailed('Save failed');
+      }
     }, 'cgpt-btn-primary');
     const syncAllBtn = createBtn('Sync All', async () => {
       try { await syncAllChatsForActiveAccount({ silent: false }); } catch (err) { setStatus('Sync failed'); }
@@ -3228,11 +3501,21 @@
     status.id = 'cgpt-archive-status';
     status.textContent = 'Waiting for input...';
 
+    const progress = document.createElement('div');
+    progress.id = 'cgpt-archive-progress';
+    progress.innerHTML = `
+      <div id="cgpt-archive-progress-track">
+        <div id="cgpt-archive-progress-fill"></div>
+      </div>
+      <div id="cgpt-archive-progress-label"></div>
+    `;
+
     wrap.appendChild(header);
     wrap.appendChild(row1);
     wrap.appendChild(row2);
     wrap.appendChild(row3);
     wrap.appendChild(row4);
+    wrap.appendChild(progress);
     wrap.appendChild(status);
 
     document.body.appendChild(showBtn);
