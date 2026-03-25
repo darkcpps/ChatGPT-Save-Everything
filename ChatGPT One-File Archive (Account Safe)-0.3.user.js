@@ -32,6 +32,9 @@
   const PROFILE_SYNC_MIN_GAP_MS = 600000;
   const ACCESS_TOKEN_CACHE_MS = 300000;
   const SESSION_INFO_CACHE_MS = 60000;
+  const UI_VISIBILITY_ANIMATION_MS = 260;
+  const MODAL_ANIMATION_MS = 220;
+  const STATUS_PULSE_MS = 420;
   const CHAT_BLOCK_SPLIT = '\n################################################################\nCHAT\n################################################################\n';
   const PROFILE_BLOCK_MARKER = '\n################################################################\nPROFILE\n################################################################\n';
 
@@ -58,6 +61,10 @@
   let cachedSessionInfoAt = 0;
   let importWizardData = null;
   let importInProgress = false;
+  let statusPulseTimer = null;
+  let wrapHideTimer = null;
+  let showButtonHideTimer = null;
+  const modalHideTimers = new WeakMap();
 
   // ============================================================
   // IndexedDB helpers
@@ -2619,9 +2626,70 @@
   // ============================================================
   // UI
   // ============================================================
+  function prefersReducedMotion() {
+    return Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+
+  function getMotionDuration(ms) {
+    return prefersReducedMotion() ? 0 : ms;
+  }
+
+  function setStatusPulse(el) {
+    if (!el) return;
+
+    el.classList.remove('cgpt-status-updated');
+    if (statusPulseTimer) {
+      clearTimeout(statusPulseTimer);
+      statusPulseTimer = null;
+    }
+
+    if (prefersReducedMotion()) return;
+
+    // Restarting the class ensures repeated updates retrigger the pulse.
+    void el.offsetWidth;
+    el.classList.add('cgpt-status-updated');
+    statusPulseTimer = setTimeout(() => {
+      el.classList.remove('cgpt-status-updated');
+      statusPulseTimer = null;
+    }, STATUS_PULSE_MS + 40);
+  }
+
+  function setModalVisibility(modal, isOpen) {
+    if (!modal) return;
+
+    const existingTimer = modalHideTimers.get(modal);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      modalHideTimers.delete(modal);
+    }
+
+    if (isOpen) {
+      modal.style.display = 'flex';
+      requestAnimationFrame(() => {
+        modal.classList.add('cgpt-modal-open');
+      });
+      return;
+    }
+
+    modal.classList.remove('cgpt-modal-open');
+    const closeDelay = getMotionDuration(MODAL_ANIMATION_MS);
+    if (!closeDelay) {
+      modal.style.display = 'none';
+      return;
+    }
+
+    const hideTimer = setTimeout(() => {
+      modal.style.display = 'none';
+      modalHideTimers.delete(modal);
+    }, closeDelay);
+    modalHideTimers.set(modal, hideTimer);
+  }
+
   function setStatus(msg) {
     const el = document.getElementById('cgpt-archive-status');
-    if (el) el.textContent = msg;
+    if (!el) return;
+    el.textContent = msg;
+    setStatusPulse(el);
   }
 
   function isUiHidden() {
@@ -2637,8 +2705,59 @@
     const wrap = document.getElementById('cgpt-archive-wrap');
     const showBtn = document.getElementById('cgpt-archive-show');
     const hidden = isUiHidden();
-    if (wrap) wrap.style.display = hidden ? 'none' : 'flex';
-    if (showBtn) showBtn.style.display = hidden ? 'flex' : 'none';
+    const hideDelay = getMotionDuration(UI_VISIBILITY_ANIMATION_MS);
+
+    if (wrapHideTimer) {
+      clearTimeout(wrapHideTimer);
+      wrapHideTimer = null;
+    }
+    if (showButtonHideTimer) {
+      clearTimeout(showButtonHideTimer);
+      showButtonHideTimer = null;
+    }
+
+    if (wrap) {
+      if (hidden) {
+        wrap.classList.remove('cgpt-visible');
+
+        if (!hideDelay) {
+          wrap.classList.remove('cgpt-leaving');
+          wrap.style.display = 'none';
+        } else {
+          wrap.classList.add('cgpt-leaving');
+          wrapHideTimer = setTimeout(() => {
+            wrap.style.display = 'none';
+            wrap.classList.remove('cgpt-leaving');
+            wrapHideTimer = null;
+          }, hideDelay);
+        }
+      } else {
+        wrap.style.display = 'flex';
+        wrap.classList.remove('cgpt-leaving');
+        requestAnimationFrame(() => {
+          wrap.classList.add('cgpt-visible');
+        });
+      }
+    }
+
+    if (showBtn) {
+      if (hidden) {
+        showBtn.style.display = 'flex';
+        requestAnimationFrame(() => {
+          showBtn.classList.add('cgpt-visible');
+        });
+      } else {
+        showBtn.classList.remove('cgpt-visible');
+        if (!hideDelay) {
+          showBtn.style.display = 'none';
+        } else {
+          showButtonHideTimer = setTimeout(() => {
+            if (!isUiHidden()) showBtn.style.display = 'none';
+            showButtonHideTimer = null;
+          }, hideDelay);
+        }
+      }
+    }
   }
 
   function updateAccountBadge() {
@@ -2653,6 +2772,10 @@
     const style = document.createElement('style');
     style.id = 'cgpt-archive-styles';
     style.innerHTML = `
+      :root {
+        --cgpt-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+        --cgpt-ease-fast: cubic-bezier(0.25, 1, 0.5, 1);
+      }
       #cgpt-archive-wrap {
         position: fixed; right: 20px; bottom: 20px; z-index: 999999;
         display: flex; flex-direction: column; gap: 12px; width: 320px;
@@ -2660,41 +2783,81 @@
         border: 1px solid rgba(255,255,255,0.1); border-radius: 16px;
         padding: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #ececf1;
+        opacity: 0; transform: translate3d(0, 14px, 0) scale(0.985); pointer-events: none;
+        transition: opacity ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out), transform ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out), box-shadow ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-fast);
       }
+      #cgpt-archive-wrap.cgpt-visible { opacity: 1; transform: translate3d(0, 0, 0) scale(1); pointer-events: auto; }
+      #cgpt-archive-wrap.cgpt-leaving { opacity: 0; transform: translate3d(0, 10px, 0) scale(0.99); pointer-events: none; }
+      #cgpt-archive-wrap > * {
+        opacity: 0; transform: translate3d(0, 8px, 0);
+        transition: opacity ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out), transform ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out);
+      }
+      #cgpt-archive-wrap.cgpt-visible > * { opacity: 1; transform: translate3d(0, 0, 0); }
+      #cgpt-archive-wrap > :nth-child(1) { transition-delay: 20ms; }
+      #cgpt-archive-wrap > :nth-child(2) { transition-delay: 45ms; }
+      #cgpt-archive-wrap > :nth-child(3) { transition-delay: 70ms; }
+      #cgpt-archive-wrap > :nth-child(4) { transition-delay: 95ms; }
+      #cgpt-archive-wrap > :nth-child(5) { transition-delay: 120ms; }
+      #cgpt-archive-wrap > :nth-child(6) { transition-delay: 145ms; }
       .cgpt-btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
       .cgpt-btn {
         background: #444654; color: #fff; border: 1px solid rgba(255,255,255,0.05);
         padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500;
-        transition: all 0.2s ease; display: flex; align-items: center; justify-content: center;
+        transition: background-color 180ms var(--cgpt-ease-fast), border-color 180ms var(--cgpt-ease-fast), color 180ms var(--cgpt-ease-fast), transform 160ms var(--cgpt-ease-fast), box-shadow 180ms var(--cgpt-ease-fast);
+        display: flex; align-items: center; justify-content: center; will-change: transform;
       }
-      .cgpt-btn:hover { background: #565869; transform: translateY(-1px); }
+      .cgpt-btn:hover { background: #565869; transform: translate3d(0, -1px, 0); box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25); }
+      .cgpt-btn:active { transform: translate3d(0, 1px, 0) scale(0.98); }
+      .cgpt-btn:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; transform: none; }
       .cgpt-btn-primary { background: #10a37f; border-color: #10a37f; }
       .cgpt-btn-primary:hover { background: #0e906f; }
       .cgpt-btn-danger { background: transparent; color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }
       .cgpt-btn-danger:hover { background: rgba(239, 68, 68, 0.1); }
       #cgpt-archive-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; margin-bottom: 4px; }
       #cgpt-archive-title { font-weight: 600; font-size: 14px; }
-      #cgpt-archive-account { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
-      #cgpt-archive-status { font-size: 12px; color: #9ca3af; text-align: center; margin-top: 4px; background: rgba(0,0,0,0.2); padding: 6px; border-radius: 6px; }
+      #cgpt-archive-account { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; transition: color 200ms var(--cgpt-ease-fast); }
+      #cgpt-archive-status {
+        font-size: 12px; color: #9ca3af; text-align: center; margin-top: 4px;
+        background: rgba(0,0,0,0.2); padding: 6px; border-radius: 6px;
+        transition: background-color 180ms var(--cgpt-ease-fast), color 180ms var(--cgpt-ease-fast), transform 180ms var(--cgpt-ease-fast);
+      }
+      #cgpt-archive-status.cgpt-status-updated {
+        animation: cgpt-status-pulse ${STATUS_PULSE_MS}ms var(--cgpt-ease-out);
+      }
+      @keyframes cgpt-status-pulse {
+        0% { transform: translate3d(0, 0, 0) scale(1); background: rgba(0,0,0,0.2); color: #9ca3af; }
+        38% { transform: translate3d(0, -1px, 0) scale(1.01); background: rgba(16, 163, 127, 0.22); color: #e2fcef; }
+        100% { transform: translate3d(0, 0, 0) scale(1); background: rgba(0,0,0,0.2); color: #9ca3af; }
+      }
       #cgpt-archive-show {
         position: fixed; right: 20px; bottom: 20px; z-index: 999999;
         background: #10a37f; color: white; border: none; padding: 12px 20px;
         border-radius: 99px; cursor: pointer; font-family: inherit; font-weight: 600; font-size: 14px;
-        box-shadow: 0 4px 12px rgba(16, 163, 127, 0.4); transition: transform 0.2s ease;
+        box-shadow: 0 4px 12px rgba(16, 163, 127, 0.4);
+        opacity: 0; transform: translate3d(0, 12px, 0) scale(0.96); pointer-events: none;
+        transition: opacity ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out), transform ${UI_VISIBILITY_ANIMATION_MS}ms var(--cgpt-ease-out), box-shadow 180ms var(--cgpt-ease-fast);
       }
-      #cgpt-archive-show:hover { transform: scale(1.05); }
+      #cgpt-archive-show.cgpt-visible { opacity: 1; transform: translate3d(0, 0, 0) scale(1); pointer-events: auto; }
+      #cgpt-archive-show:hover { transform: translate3d(0, 0, 0) scale(1.03); box-shadow: 0 10px 24px rgba(16, 163, 127, 0.36); }
+      #cgpt-archive-show:active { transform: translate3d(0, 1px, 0) scale(0.98); }
       #cgpt-archive-guide-modal {
         position: fixed; inset: 0; z-index: 1000000; display: none;
         align-items: center; justify-content: center;
         background: rgba(0, 0, 0, 0.65);
         padding: 16px;
+        opacity: 0; pointer-events: none;
+        transition: opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
       }
       .cgpt-guide-panel {
         width: min(760px, 95vw); max-height: 86vh; overflow: auto;
         background: #1f2023; border: 1px solid rgba(255,255,255,0.12); border-radius: 14px;
         box-shadow: 0 16px 40px rgba(0,0,0,0.5); color: #ececf1;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        transform: translate3d(0, 14px, 0) scale(0.985); opacity: 0.95;
+        transition: transform ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out), opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
       }
+      #cgpt-archive-guide-modal.cgpt-modal-open { opacity: 1; pointer-events: auto; }
+      #cgpt-archive-guide-modal.cgpt-modal-open .cgpt-guide-panel { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
       .cgpt-guide-head {
         display: flex; align-items: center; justify-content: space-between;
         padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.1);
@@ -2704,8 +2867,10 @@
       .cgpt-guide-close {
         background: transparent; color: #ececf1; border: 1px solid rgba(255,255,255,0.2);
         border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px; font-weight: 600;
+        transition: background-color 160ms var(--cgpt-ease-fast), transform 160ms var(--cgpt-ease-fast);
       }
-      .cgpt-guide-close:hover { background: rgba(255,255,255,0.08); }
+      .cgpt-guide-close:hover { background: rgba(255,255,255,0.08); transform: translate3d(0, -1px, 0); }
+      .cgpt-guide-close:active { transform: translate3d(0, 1px, 0) scale(0.98); }
       .cgpt-guide-body { padding: 14px 16px 16px; font-size: 13px; line-height: 1.45; }
       .cgpt-guide-body h3 { margin: 8px 0 8px; font-size: 14px; color: #93c5fd; }
       .cgpt-guide-body ol { margin: 0 0 12px 20px; padding: 0; }
@@ -2724,13 +2889,19 @@
         position: fixed; inset: 0; z-index: 1000001; display: none;
         align-items: center; justify-content: center;
         background: rgba(0, 0, 0, 0.72); padding: 16px;
+        opacity: 0; pointer-events: none;
+        transition: opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
       }
       .cgpt-import-panel {
         width: min(820px, 96vw); max-height: 88vh; overflow: auto;
         background: #17181b; border: 1px solid rgba(255,255,255,0.16); border-radius: 14px;
         box-shadow: 0 20px 48px rgba(0,0,0,0.55); color: #ececf1;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        transform: translate3d(0, 14px, 0) scale(0.985); opacity: 0.95;
+        transition: transform ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out), opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
       }
+      #cgpt-archive-import-modal.cgpt-modal-open { opacity: 1; pointer-events: auto; }
+      #cgpt-archive-import-modal.cgpt-modal-open .cgpt-import-panel { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
       .cgpt-import-head {
         display: flex; justify-content: space-between; align-items: center;
         padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.12);
@@ -2748,10 +2919,27 @@
       .cgpt-import-summary {
         margin-top: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
         border-radius: 10px; padding: 10px; color: #d1d5db;
+        transition: border-color 180ms var(--cgpt-ease-fast), background-color 180ms var(--cgpt-ease-fast);
       }
       .cgpt-import-hint {
         margin-top: 10px; padding: 10px; border-radius: 8px;
         background: rgba(59, 130, 246, 0.14); border: 1px solid rgba(59, 130, 246, 0.35);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #cgpt-archive-wrap,
+        #cgpt-archive-wrap > *,
+        .cgpt-btn,
+        #cgpt-archive-show,
+        #cgpt-archive-guide-modal,
+        #cgpt-archive-import-modal,
+        .cgpt-guide-panel,
+        .cgpt-import-panel,
+        .cgpt-guide-close,
+        #cgpt-archive-status {
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
       }
       @media (max-width: 780px) {
         .cgpt-import-actions { grid-template-columns: 1fr; }
@@ -2763,7 +2951,7 @@
 
   function closeGuideModal() {
     const modal = document.getElementById('cgpt-archive-guide-modal');
-    if (modal) modal.style.display = 'none';
+    setModalVisibility(modal, false);
   }
 
   function ensureGuideModal() {
@@ -2835,12 +3023,12 @@
 
   function openGuideModal() {
     const modal = ensureGuideModal();
-    modal.style.display = 'flex';
+    setModalVisibility(modal, true);
   }
 
   function closeImportWizardModal() {
     const modal = document.getElementById('cgpt-archive-import-modal');
-    if (modal) modal.style.display = 'none';
+    setModalVisibility(modal, false);
   }
 
   function ensureImportWizardModal() {
@@ -2963,7 +3151,7 @@
 
   function openImportWizardModal() {
     const modal = ensureImportWizardModal();
-    modal.style.display = 'flex';
+    setModalVisibility(modal, true);
     updateImportWizardUi();
   }
 
