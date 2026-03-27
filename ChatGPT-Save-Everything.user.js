@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         ChatGPT One-File Archive (Account Safe)
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.10
 // @description  Archive ChatGPT chats and profile context into one local TXT file, with account-safe labels, auto-sync, and import tools.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @homepageURL  https://github.com/darkcpps/ChatGPT-Save-Everything
+// @updateURL    https://raw.githubusercontent.com/darkcpps/ChatGPT-Save-Everything/main/ChatGPT-Save-Everything.user.js
+// @downloadURL  https://raw.githubusercontent.com/darkcpps/ChatGPT-Save-Everything/main/ChatGPT-Save-Everything.user.js
 // @grant        none
 // ==/UserScript==
 
@@ -44,6 +47,15 @@
   const MEMORY_SYNC_STATUS_STALE = 'stale';
   const MEMORY_SYNC_STATUS_FAILED = 'failed';
   const MEMORY_SYNC_STATUS_UNKNOWN = 'unknown';
+  const SCRIPT_VERSION = '2.10';
+  const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  const UPDATE_LAST_CHECK_KEY = 'cgptArchiveUpdateLastCheckAt';
+  const UPDATE_DISMISSED_VERSION_KEY = 'cgptArchiveUpdateDismissedVersion';
+  const UPDATE_CHECK_CANDIDATES = [
+    'https://raw.githubusercontent.com/darkcpps/ChatGPT-Save-Everything/main/ChatGPT-Save-Everything.user.js',
+    'https://cdn.jsdelivr.net/gh/darkcpps/ChatGPT-Save-Everything@main/ChatGPT-Save-Everything.user.js'
+  ];
+  const UPDATE_INSTALL_URL = UPDATE_CHECK_CANDIDATES[0];
 
   // ============================================================
   // Runtime state
@@ -444,6 +456,9 @@
       const message = messages[i] || {};
       const role = String(message.role || 'unknown').toUpperCase();
       lines.push(`----- [${i + 1}] ${role} -----`);
+      if (message?.timestamp) {
+        lines.push(`Time: ${formatTimestamp(message.timestamp)}`);
+      }
       lines.push(message.text || '');
       const msgUrls = Array.isArray(message.urls) ? message.urls : [];
       if (msgUrls.length) {
@@ -1841,6 +1856,32 @@
     return '';
   }
 
+  function normalizeTimestampInput(value) {
+    if (value === null || value === undefined) return '';
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const ms = value > 1e12 ? value : value * 1000;
+      const date = new Date(ms);
+      return Number.isFinite(date.getTime()) ? date.toISOString() : '';
+    }
+
+    const raw = cleanText(String(value || ''));
+    if (!raw) return '';
+
+    if (/^\d+(\.\d+)?$/.test(raw)) {
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        const ms = numeric > 1e12 ? numeric : numeric * 1000;
+        const date = new Date(ms);
+        return Number.isFinite(date.getTime()) ? date.toISOString() : '';
+      }
+    }
+
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed)) return '';
+    return new Date(parsed).toISOString();
+  }
+
   function extractConversationMessages(payload) {
     const mapping = payload?.mapping;
     if (!mapping || typeof mapping !== 'object') return [];
@@ -1867,6 +1908,17 @@
       const message = node?.message;
       const role = cleanText(message?.author?.role || 'unknown').toLowerCase();
       const text = extractMessageTextContent(message?.content);
+      const timestamp = normalizeTimestampInput(
+        message?.create_time ||
+        message?.update_time ||
+        message?.metadata?.create_time ||
+        message?.metadata?.created_at ||
+        message?.metadata?.update_time ||
+        message?.metadata?.updated_at ||
+        message?.metadata?.timestamp ||
+        node?.create_time ||
+        node?.update_time
+      );
       const urlSet = new Set([
         ...extractUrlsFromText(text),
         ...urlsFromUnknownPayload(message?.content),
@@ -1877,7 +1929,7 @@
       if (!text && !urls.length) continue;
       if (role === 'system') continue;
 
-      messages.push({ role, text: text || '[non-text content]', urls });
+      messages.push({ role, text: text || '[non-text content]', urls, timestamp });
     }
 
     return messages;
@@ -2193,6 +2245,11 @@
 
       const role = cleanText((lines[i + 1] || '').replace(/^\[\d+\]\s+/, '')).toLowerCase() || 'unknown';
       i += 3;
+      let timestamp = '';
+      if ((lines[i] || '').startsWith('Time: ')) {
+        timestamp = normalizeTimestampInput(parseArchiveField(lines[i], 'Time: '));
+        i++;
+      }
 
       const textLines = [];
       while (i < lines.length) {
@@ -2213,7 +2270,7 @@
 
       const text = cleanText(textLines.join('\n'));
       if (text) {
-        messages.push({ role, text });
+        messages.push({ role, text, timestamp });
       }
     }
 
@@ -2571,6 +2628,106 @@
     } catch {
       // Ignore localStorage failures and continue with defaults.
     }
+  }
+
+  function parseVersionParts(version) {
+    return String(version || '')
+      .split(/[^0-9]+/g)
+      .filter(Boolean)
+      .map((part) => Number(part) || 0);
+  }
+
+  function compareVersions(a, b) {
+    const pa = parseVersionParts(a);
+    const pb = parseVersionParts(b);
+    const maxLen = Math.max(pa.length, pb.length);
+    for (let i = 0; i < maxLen; i++) {
+      const va = pa[i] || 0;
+      const vb = pb[i] || 0;
+      if (va > vb) return 1;
+      if (va < vb) return -1;
+    }
+    return 0;
+  }
+
+  function extractUserscriptVersion(scriptText) {
+    const match = String(scriptText || '').match(/@version\s+([^\s]+)/i);
+    return cleanText(match?.[1] || '');
+  }
+
+  function shouldRunUpdateCheck() {
+    try {
+      const last = Number(localStorage.getItem(UPDATE_LAST_CHECK_KEY) || 0);
+      return !last || (Date.now() - last) > UPDATE_CHECK_INTERVAL_MS;
+    } catch {
+      return true;
+    }
+  }
+
+  function markUpdateCheckRan() {
+    try {
+      localStorage.setItem(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+    } catch {
+      // Ignore localStorage failures and continue.
+    }
+  }
+
+  async function fetchLatestScriptVersion() {
+    for (const url of UPDATE_CHECK_CANDIDATES) {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) continue;
+        const text = await res.text();
+        const version = extractUserscriptVersion(text);
+        if (version) {
+          return { version, sourceUrl: url };
+        }
+      } catch {
+        // Try next candidate.
+      }
+    }
+    return null;
+  }
+
+  async function maybePromptForScriptUpdate() {
+    if (!shouldRunUpdateCheck()) return;
+    markUpdateCheckRan();
+
+    const latest = await fetchLatestScriptVersion();
+    if (!latest?.version) return;
+    if (compareVersions(latest.version, SCRIPT_VERSION) <= 0) return;
+
+    let dismissedVersion = '';
+    try {
+      dismissedVersion = cleanText(localStorage.getItem(UPDATE_DISMISSED_VERSION_KEY) || '');
+    } catch {
+      dismissedVersion = '';
+    }
+    if (dismissedVersion && dismissedVersion === latest.version) return;
+
+    const shouldOpenUpdate = confirm(
+      `Update available: v${latest.version} (current v${SCRIPT_VERSION}).\n\n` +
+      'Open the update page now?\n\n' +
+      'Your local archive data is safe: updating the script does not delete your saved chats, profiles, or archive files.'
+    );
+
+    if (shouldOpenUpdate) {
+      try {
+        localStorage.removeItem(UPDATE_DISMISSED_VERSION_KEY);
+      } catch {
+        // Ignore localStorage failures and continue.
+      }
+      window.open(UPDATE_INSTALL_URL, '_blank', 'noopener');
+      setStatus(`Update available: v${latest.version}. Install page opened.`);
+      return;
+    }
+
+    try {
+      localStorage.setItem(UPDATE_DISMISSED_VERSION_KEY, latest.version);
+    } catch {
+      // Ignore localStorage failures and continue.
+    }
+    setStatus(`Update available: v${latest.version} (dismissed for now).`);
   }
 
   // ============================================================
@@ -3016,6 +3173,9 @@
       lines.push('------------------------------------------------------------');
       lines.push('[' + (i + 1) + '] ' + String(m.role || 'unknown').toUpperCase());
       lines.push('------------------------------------------------------------');
+      if (m?.timestamp) {
+        lines.push('Time: ' + formatTimestamp(m.timestamp));
+      }
       lines.push(m.text || '');
       if (Array.isArray(m.urls) && m.urls.length) {
         lines.push('');
@@ -3664,6 +3824,9 @@
     const messages = Array.isArray(chat?.messages) ? chat.messages : [];
     for (const message of messages) {
       lines.push(`[${String(message?.role || 'unknown').toUpperCase()}]`);
+      if (message?.timestamp) {
+        lines.push(`Time: ${formatTimestamp(message.timestamp)}`);
+      }
       lines.push(message?.text || '');
       if (Array.isArray(message?.urls) && message.urls.length) {
         lines.push('');
@@ -5785,6 +5948,12 @@
     } catch (e) {
       // Ignore localStorage errors in incognito or blocked environments
     }
+
+    setTimeout(() => {
+      maybePromptForScriptUpdate().catch((err) => {
+        console.warn('Update check failed:', err);
+      });
+    }, 1600);
 
     setInterval(addUi, 2000);
     scheduleCapture();
