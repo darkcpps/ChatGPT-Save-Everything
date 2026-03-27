@@ -13,6 +13,7 @@ It can:
 - Save the current chat on demand
 - Sync your full chat history into one archive file
 - Capture profile data like custom instructions, About You, and memories where available
+- Capture project-level custom instructions and project chat metadata where available
 - Separate multiple ChatGPT accounts by label, so work and personal archives stay cleanly grouped
 - Import archive content back into the currently logged-in account with a guided wizard
 
@@ -28,7 +29,11 @@ It can:
 - `Save Now` for the current open chat
 - `Sync All` for a full backup sweep
 - `Sync Profile` for account context refreshes
-- `Import Wizard` for restoring archive content into a live account
+- Project-aware sync support for chats that belong to ChatGPT Projects
+- `Import Wizard` for restoring custom instructions, memories, and archived chats into a live account
+- Chat import modes: one-thread import or separate-thread-per-chat import
+- Import Wizard cleanup action to remove source-account chats from local archive after migration
+- Bundle folder export with per-chat folders (`archive.txt` + `media` + `sources` + `code` + `files`, plus automatic asset download attempts)
 - Background auto-sync while the tab stays open
 - Account labels like `main`, `work`, or `testing`
 
@@ -38,9 +43,10 @@ It can:
 2. Add this script:
    - [`ChatGPT-Save-Everything.user.js`](./ChatGPT-Save-Everything.user.js)
 3. Open ChatGPT after the script is installed.
-4. In the Archive Manager panel, click `Set Account` and choose a unique label for the current login.
-5. Click `Choose File` and create or select your archive `.txt` file.
-6. Click `Sync All` for the first full backup.
+4. Follow the automatic **First-Time Archive Setup** walkthrough (it opens on first run).
+5. In the Archive Manager panel, click `Set Account` and choose a unique label for the current login.
+6. Click `Choose File` and create or select your archive `.txt` file.
+7. Click `Sync All` for the first full backup.
 
 ## Suggested Workflow
 
@@ -62,7 +68,7 @@ Use `Import Wizard` when you want to load an archive file and push content into 
 The wizard is especially useful if you:
 
 - Move between accounts
-- Want to restore custom instructions or account context
+- Want to restore custom instructions, memories, or account context
 - Need to rehydrate old chats into a fresh session
 
 ## Notes

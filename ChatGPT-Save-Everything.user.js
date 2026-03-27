@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT One-File Archive (Account Safe)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      2.8
 // @description  Archive ChatGPT chats and profile context into one local TXT file, with account-safe labels, auto-sync, and import tools.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -17,11 +17,14 @@
   const DB_NAME = 'cgpt_archive_v3';
   const DB_STORE = 'kv';
   const FILE_HANDLE_KEY = 'archiveFileHandle';
+  const BUNDLE_FOLDER_HANDLE_KEY = 'archiveBundleFolderHandle';
+  const EXPORT_SETTINGS_KEY = 'cgptArchiveExportSettings';
   const CHAT_KEY_PREFIX = 'account:';
   const PROFILE_KEY_PREFIX = 'profile:';
   const ACCOUNT_LABEL_KEY = 'cgptArchiveAccountLabel';
   const LABEL_BINDINGS_KEY = 'cgptArchiveLabelBindings';
   const UI_HIDDEN_KEY = 'cgptArchiveUiHidden';
+  const SETUP_SHOWN_KEY = 'cgpt-archive-setup-shown-v2';
   const SAVE_DEBOUNCE_MS = 1400;
   const DELETE_DELAY_MS = 1800;
   const FULL_SYNC_PAGE_SIZE = 100;
@@ -69,6 +72,9 @@
   let progressHideTimer = null;
   let wrapHideTimer = null;
   let showButtonHideTimer = null;
+  let guideStepIndex = 0;
+  let hasArchiveFileHandle = false;
+  let hasBundleFolderHandle = false;
   const modalHideTimers = new WeakMap();
 
   // ============================================================
@@ -193,6 +199,19 @@
     await dbSet(FILE_HANDLE_KEY, handle);
   }
 
+  async function getSavedBundleFolderHandle() {
+    try {
+      return await dbGet(BUNDLE_FOLDER_HANDLE_KEY);
+    } catch (err) {
+      console.error('Could not restore bundle folder handle:', err);
+      return null;
+    }
+  }
+
+  async function setSavedBundleFolderHandle(handle) {
+    await dbSet(BUNDLE_FOLDER_HANDLE_KEY, handle);
+  }
+
   async function ensureWritePermission(handle) {
     if (!handle) return false;
 
@@ -230,10 +249,24 @@
     });
 
     await setSavedFileHandle(handle);
+    hasArchiveFileHandle = true;
     archiveImportDone = false;
     archiveImportPromise = null;
     await maybeImportArchiveFromFile(handle);
     setStatus('Archive file selected');
+    return handle;
+  }
+
+  async function chooseArchiveBundleFolder() {
+    if (!window.showDirectoryPicker) {
+      alert('This browser does not support directory picker. Use recent Chrome/Edge for bundle folder export.');
+      return null;
+    }
+
+    const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    await setSavedBundleFolderHandle(handle);
+    hasBundleFolderHandle = true;
+    setStatus('Bundle folder selected');
     return handle;
   }
 
@@ -276,6 +309,330 @@
 
   function parseArchiveField(line, prefix) {
     return line.startsWith(prefix) ? line.slice(prefix.length) : '';
+  }
+
+  function sanitizeFilename(name, fallback = 'file') {
+    const safe = cleanText(String(name || ''))
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[. ]+$/g, '');
+    return safe || fallback;
+  }
+
+  function extractUrlsFromText(text) {
+    const input = String(text || '');
+    const regex = /https?:\/\/[^\s<>"'`]+/gi;
+    const urls = [];
+    let match;
+    while ((match = regex.exec(input)) !== null) {
+      const raw = cleanText(match[0] || '');
+      if (!raw) continue;
+      const normalized = raw.replace(/[),.;!?]+$/g, '');
+      if (!normalized) continue;
+      urls.push(normalized);
+    }
+    return urls;
+  }
+
+  function extractCodeBlocksFromText(text) {
+    const input = String(text || '');
+    const regex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+    const out = [];
+    let match;
+    while ((match = regex.exec(input)) !== null) {
+      const lang = cleanText(match[1] || '');
+      const code = String(match[2] || '').replace(/\r\n?/g, '\n').trim();
+      if (!code) continue;
+      out.push({ lang, code });
+    }
+    return out;
+  }
+
+  function classifyUrlKind(url) {
+    const input = String(url || '').toLowerCase();
+    if (!input) return 'source';
+    // ChatGPT estuary URLs are commonly used for generated/uploaded images.
+    if (input.includes('/backend-api/estuary/content') || input.includes('/estuary/content')) return 'media';
+    if (/\.(png|jpe?g|gif|webp|svg|bmp|tiff?|avif|heic)(\?|#|$)/i.test(input)) return 'media';
+    if (/\.(mp4|mov|webm|m4v|avi|mkv|mp3|wav|ogg|flac)(\?|#|$)/i.test(input)) return 'media';
+    if (input.includes('/image') || input.includes('/images/') || input.includes('/media/')) return 'media';
+    if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|tar|gz|csv|json|txt|md)(\?|#|$)/i.test(input)) return 'file';
+    if (input.includes('/files/') || input.includes('/file/') || input.includes('download')) return 'file';
+    return 'source';
+  }
+
+  function extensionFromUrl(url) {
+    try {
+      const parsed = new URL(url);
+      const path = parsed.pathname || '';
+      const extMatch = path.match(/\.([a-zA-Z0-9]{1,8})$/);
+      return extMatch ? `.${extMatch[1].toLowerCase()}` : '';
+    } catch {
+      const extMatch = String(url || '').match(/\.([a-zA-Z0-9]{1,8})(\?|#|$)/);
+      return extMatch ? `.${String(extMatch[1]).toLowerCase()}` : '';
+    }
+  }
+
+  function extensionFromMime(contentType) {
+    const type = String(contentType || '').toLowerCase();
+    if (type.includes('image/png')) return '.png';
+    if (type.includes('image/jpeg')) return '.jpg';
+    if (type.includes('image/webp')) return '.webp';
+    if (type.includes('image/gif')) return '.gif';
+    if (type.includes('image/svg')) return '.svg';
+    if (type.includes('video/mp4')) return '.mp4';
+    if (type.includes('video/webm')) return '.webm';
+    if (type.includes('audio/mpeg')) return '.mp3';
+    if (type.includes('audio/wav')) return '.wav';
+    if (type.includes('application/pdf')) return '.pdf';
+    if (type.includes('application/zip')) return '.zip';
+    if (type.includes('application/json')) return '.json';
+    if (type.includes('text/plain')) return '.txt';
+    return '';
+  }
+
+  async function writeTextFileInFolder(dirHandle, fileName, text) {
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(String(text || ''));
+    await writable.close();
+  }
+
+  async function writeBlobFileInFolder(dirHandle, fileName, blob) {
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  }
+
+  function urlsFromUnknownPayload(value) {
+    const strings = extractStringLeaves(value, [], 0, 6, 120);
+    const set = new Set();
+    for (const item of strings) {
+      for (const url of extractUrlsFromText(item)) {
+        set.add(url);
+      }
+    }
+    return [...set];
+  }
+
+  function getUrlFileBaseName(url, fallbackBase = 'asset') {
+    try {
+      const parsed = new URL(url);
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const raw = parts.length ? decodeURIComponent(parts[parts.length - 1]) : fallbackBase;
+      const withoutExt = raw.replace(/\.[a-zA-Z0-9]{1,8}$/, '');
+      return sanitizeFilename(withoutExt || fallbackBase, fallbackBase);
+    } catch {
+      return sanitizeFilename(fallbackBase, fallbackBase);
+    }
+  }
+
+  function renderChatTranscriptText(chat) {
+    const lines = [];
+    lines.push(`Title: ${chat?.title || 'Untitled Chat'}`);
+    lines.push(`Chat ID: ${chat?.id || ''}`);
+    lines.push(`Project ID: ${chat?.projectId || ''}`);
+    lines.push(`Project Name: ${getChatProjectName(chat)}`);
+    lines.push(`URL: ${chat?.url || ''}`);
+    lines.push(`Last Updated: ${formatTimestamp(chat?.updatedAt || '')}`);
+    lines.push('');
+
+    const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i] || {};
+      const role = String(message.role || 'unknown').toUpperCase();
+      lines.push(`----- [${i + 1}] ${role} -----`);
+      lines.push(message.text || '');
+      const msgUrls = Array.isArray(message.urls) ? message.urls : [];
+      if (msgUrls.length) {
+        lines.push('Attached/Referenced URLs:');
+        for (const url of msgUrls) {
+          lines.push(`- ${url}`);
+        }
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  function collectBundleArtifacts(chats, profiles) {
+    const sourceUrls = new Set();
+    const mediaUrls = new Set();
+    const fileUrls = new Set();
+    const codeBlocks = [];
+    const perChat = [];
+
+    const addProfileText = (text, context = '') => {
+      for (const url of extractUrlsFromText(text)) {
+        sourceUrls.add(url);
+        const kind = classifyUrlKind(url);
+        if (kind === 'media') mediaUrls.add(url);
+        if (kind === 'file') fileUrls.add(url);
+      }
+      for (const block of extractCodeBlocksFromText(text)) {
+        codeBlocks.push({ lang: block.lang || '', code: block.code, context });
+      }
+    };
+
+    for (let chatIndex = 0; chatIndex < chats.length; chatIndex++) {
+      const chat = chats[chatIndex] || {};
+      const chatSources = new Set();
+      const chatMedia = new Set();
+      const chatFiles = new Set();
+      const chatCode = [];
+
+      const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i] || {};
+        const msgUrls = new Set([
+          ...extractUrlsFromText(message?.text || ''),
+          ...(Array.isArray(message?.urls) ? message.urls : [])
+        ]);
+
+        for (const url of msgUrls) {
+          chatSources.add(url);
+          sourceUrls.add(url);
+          const kind = classifyUrlKind(url);
+          if (kind === 'media') {
+            chatMedia.add(url);
+            mediaUrls.add(url);
+          }
+          if (kind === 'file') {
+            chatFiles.add(url);
+            fileUrls.add(url);
+          }
+        }
+
+        for (const block of extractCodeBlocksFromText(message?.text || '')) {
+          const entry = { lang: block.lang || '', code: block.code, context: `${chat?.title || 'Untitled Chat'} #${i + 1}` };
+          chatCode.push(entry);
+          codeBlocks.push(entry);
+        }
+      }
+
+      perChat.push({
+        chatIndex,
+        chatId: chat?.id || `chat-${chatIndex + 1}`,
+        chatTitle: chat?.title || 'Untitled Chat',
+        chat,
+        sourceUrls: [...chatSources].sort((a, b) => a.localeCompare(b)),
+        mediaUrls: [...chatMedia].sort((a, b) => a.localeCompare(b)),
+        fileUrls: [...chatFiles].sort((a, b) => a.localeCompare(b)),
+        codeBlocks: chatCode
+      });
+    }
+
+    for (const profile of profiles) {
+      addProfileText(profile?.customInstructions?.aboutUser || '', 'Custom Instructions (about user)');
+      addProfileText(profile?.customInstructions?.aboutModel || '', 'Custom Instructions (about model)');
+      addProfileText(profile?.aboutYou?.text || '', 'About You');
+
+      const projectInstructions = Array.isArray(profile?.projectInstructions)
+        ? profile.projectInstructions
+        : [];
+      for (const item of projectInstructions) {
+        addProfileText(
+          item?.instructions || '',
+          `Project Instructions (${item?.projectName || item?.projectId || 'project'})`
+        );
+      }
+    }
+
+    return {
+      sourceUrls: [...sourceUrls].sort((a, b) => a.localeCompare(b)),
+      mediaUrls: [...mediaUrls].sort((a, b) => a.localeCompare(b)),
+      fileUrls: [...fileUrls].sort((a, b) => a.localeCompare(b)),
+      codeBlocks,
+      perChat
+    };
+  }
+
+  function formatChatHeader(chatEntry) {
+    const title = cleanText(chatEntry?.chatTitle || 'Untitled Chat');
+    const chatId = cleanText(chatEntry?.chatId || '');
+    return chatId ? `${title} (${chatId})` : title;
+  }
+
+  function buildBundleUrlReport(artifacts, kind) {
+    const keyMap = {
+      sources: 'sourceUrls',
+      media: 'mediaUrls',
+      files: 'fileUrls'
+    };
+    const titleMap = {
+      sources: 'Sources',
+      media: 'Media URLs',
+      files: 'File URLs'
+    };
+
+    const field = keyMap[kind] || 'sourceUrls';
+    const title = titleMap[kind] || 'URLs';
+    const uniqueUrls = Array.isArray(artifacts?.[field]) ? artifacts[field] : [];
+    const perChat = Array.isArray(artifacts?.perChat) ? artifacts.perChat : [];
+
+    const lines = [`# ${title}`, '', '## All Unique URLs', ''];
+    if (uniqueUrls.length) {
+      for (const url of uniqueUrls) lines.push(`- ${url}`);
+    } else {
+      lines.push('(No URLs found)');
+    }
+    lines.push('');
+    lines.push(`Total Unique: ${uniqueUrls.length}`);
+    lines.push('');
+    lines.push('## By Chat');
+    lines.push('');
+
+    let chatsWithUrls = 0;
+    for (const chatEntry of perChat) {
+      const chatUrls = Array.isArray(chatEntry?.[field]) ? chatEntry[field] : [];
+      if (!chatUrls.length) continue;
+      chatsWithUrls += 1;
+      lines.push(`### Chat: ${formatChatHeader(chatEntry)}`);
+      for (const url of chatUrls) lines.push(`- ${url}`);
+      lines.push('');
+    }
+
+    if (!chatsWithUrls) {
+      lines.push('(No chat-specific URLs found)');
+      lines.push('');
+    }
+
+    lines.push(`Chats With ${title}: ${chatsWithUrls}`);
+    return lines.join('\n');
+  }
+
+  async function fetchAssetBlob(url) {
+    let response = null;
+    let lastError = null;
+
+    const attempts = [
+      () => fetch(url, { credentials: 'include' }),
+      () => fetch(url, { credentials: 'omit' })
+    ];
+
+    for (const run of attempts) {
+      try {
+        const res = await run();
+        if (!res.ok) {
+          lastError = new Error(`HTTP ${res.status}`);
+          continue;
+        }
+        response = res;
+        break;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    if (!response) throw lastError || new Error('Download failed');
+    const blob = await response.blob();
+    return {
+      blob,
+      contentType: response.headers.get('content-type') || ''
+    };
   }
 
   function squeezeWhitespace(text) {
@@ -967,7 +1324,7 @@
     profileSyncPromise = (async () => {
       lastProfileSyncStartedAt = Date.now();
       if (!silent) setStatus(`Syncing profile for ${activeAccountLabel}...`);
-      const profileStepTotal = 5;
+      const profileStepTotal = 6;
       let profileStepDone = 0;
       const profileStep = (label) => {
         if (silent) return;
@@ -1007,6 +1364,9 @@
         ),
         memoriesLastSuccessfulSyncAt: cleanText(existingProfile?.memoriesLastSuccessfulSyncAt || ''),
         memoriesLastError: cleanText(existingProfile?.memoriesLastError || ''),
+        projectInstructions: Array.isArray(existingProfile?.projectInstructions)
+          ? normalizeProjectInstructionItems(existingProfile.projectInstructions)
+          : [],
         warnings: []
       };
 
@@ -1050,6 +1410,17 @@
       }
       profileStep('Memories checked');
 
+      try {
+        const projectResult = await fetchProjectInstructions();
+        profile.projectInstructions = projectResult.items;
+        if (Array.isArray(projectResult.warnings) && projectResult.warnings.length) {
+          profile.warnings.push(...projectResult.warnings);
+        }
+      } catch (err) {
+        profile.warnings.push(`Project instructions fetch failed: ${err?.message || err}`);
+      }
+      profileStep('Project instructions checked');
+
       await dbSet(profileStorageKey(activeAccountLabel), profile);
       profileStep('Profile saved');
       await rebuildArchiveFile();
@@ -1059,7 +1430,7 @@
         setStatus(
           `Profile synced: ${profile.memories.length} memories (${formatMemorySyncStatus(profile.memoriesSyncStatus).toLowerCase()}), custom instructions ` +
           (profile.customInstructions.aboutUser || profile.customInstructions.aboutModel ? 'captured' : 'empty') +
-          `, about-you ${profile.aboutYou.text ? 'captured' : 'empty'}`
+          `, about-you ${profile.aboutYou.text ? 'captured' : 'empty'}, project instructions ${profile.projectInstructions.length}`
         );
         setProgressDone('Profile sync complete');
       }
@@ -1128,6 +1499,292 @@
     return all;
   }
 
+  function parseProjectListItems(data) {
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.items)) return data.items;
+    if (Array.isArray(data?.projects)) return data.projects;
+    if (Array.isArray(data?.data?.items)) return data.data.items;
+    if (Array.isArray(data?.data?.projects)) return data.data.projects;
+    if (Array.isArray(data?.workspaces)) return data.workspaces;
+    if (Array.isArray(data?.data?.workspaces)) return data.data.workspaces;
+    return [];
+  }
+
+  function normalizeProjectInstructionText(value) {
+    if (typeof value === 'string') return cleanText(value);
+    if (value === null || value === undefined) return '';
+    const lines = uniqueNormalizedLines(extractStringLeaves(value, [], 0, 5, 40));
+    return lines.join('\n');
+  }
+
+  function extractProjectInstructionText(payload) {
+    if (!payload || typeof payload !== 'object') return '';
+    const root = (payload?.data && typeof payload.data === 'object') ? payload.data : payload;
+    const direct = [
+      root?.instructions,
+      root?.instruction,
+      root?.custom_instructions,
+      root?.customInstructions,
+      root?.system_prompt,
+      root?.systemPrompt,
+      root?.project_instructions,
+      root?.projectInstructions,
+      root?.prompt,
+      root?.settings?.instructions,
+      root?.settings?.custom_instructions,
+      root?.settings?.system_prompt
+    ];
+
+    for (const candidate of direct) {
+      const normalized = normalizeProjectInstructionText(candidate);
+      if (normalized) return normalized;
+    }
+
+    const deep = findValueByKeysDeep(root, [
+      'instructions',
+      'instruction',
+      'custom_instructions',
+      'customInstructions',
+      'system_prompt',
+      'systemPrompt',
+      'project_instructions',
+      'projectInstructions',
+      'prompt'
+    ], 7);
+
+    return normalizeProjectInstructionText(deep);
+  }
+
+  function normalizeProjectInstructionItem(item, index = 0) {
+    const projectId = pickFirstString([
+      item?.projectId,
+      item?.project_id,
+      item?.id,
+      item?.workspace_id,
+      item?.workspaceId,
+      item?.uuid,
+      `project-${index + 1}`
+    ]);
+    const projectName = pickFirstString([
+      item?.projectName,
+      item?.project_name,
+      item?.name,
+      item?.title,
+      item?.workspace_name,
+      item?.workspaceName
+    ]);
+    const instructions = normalizeProjectInstructionText(
+      item?.instructions ??
+      item?.custom_instructions ??
+      item?.customInstructions ??
+      item?.system_prompt ??
+      item?.systemPrompt ??
+      extractProjectInstructionText(item)
+    );
+    const sourceUrl = cleanText(item?.sourceUrl || item?.source_url || '');
+    const rawUpdatedAt = pickFirstString([
+      item?.updatedAt,
+      item?.updated_at,
+      item?.update_time,
+      item?.created_at,
+      item?.create_time
+    ]);
+    const updatedAt = Number.isFinite(Date.parse(rawUpdatedAt))
+      ? new Date(rawUpdatedAt).toISOString()
+      : '';
+
+    if (!projectId && !projectName && !instructions) return null;
+    return {
+      projectId,
+      projectName,
+      instructions,
+      sourceUrl,
+      updatedAt
+    };
+  }
+
+  function normalizeProjectInstructionItems(items) {
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < items.length; i++) {
+      const normalized = normalizeProjectInstructionItem(items[i], i);
+      if (!normalized) continue;
+      const key = `${normalized.projectId || ''}|${(normalized.projectName || '').toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(normalized);
+    }
+    return out;
+  }
+
+  function normalizeProjectMeta(meta, index = 0) {
+    return {
+      id: pickFirstString([
+        meta?.id,
+        meta?.project_id,
+        meta?.projectId,
+        meta?.workspace_id,
+        meta?.workspaceId,
+        meta?.uuid,
+        `project-${index + 1}`
+      ]),
+      name: pickFirstString([
+        meta?.name,
+        meta?.title,
+        meta?.project_name,
+        meta?.projectName,
+        meta?.workspace_name,
+        meta?.workspaceName
+      ]),
+      updatedAt: meta?.updated_at || meta?.update_time || meta?.created_at || meta?.create_time || '',
+      instructions: extractProjectInstructionText(meta),
+      sourceUrl: cleanText(meta?.sourceUrl || '')
+    };
+  }
+
+  async function fetchProjectList() {
+    const base = getConversationApiOrigin();
+    const candidates = [
+      `${base}/backend-api/projects?offset=0&limit=200`,
+      `${base}/backend-api/projects?limit=200`,
+      `${base}/backend-api/projects`,
+      `${base}/backend-api/project`
+    ];
+    const { url, data } = await fetchFirstSuccessfulJson(candidates, { authMode: 'auto' });
+    return parseProjectListItems(data)
+      .map((project, index) => {
+        const normalized = normalizeProjectMeta(project, index);
+        normalized.sourceUrl = normalized.sourceUrl || url;
+        return normalized;
+      })
+      .filter((project) => project.id || project.name);
+  }
+
+  async function fetchProjectDetailById(projectId) {
+    const base = getConversationApiOrigin();
+    const encoded = encodeURIComponent(projectId);
+    const candidates = [
+      `${base}/backend-api/projects/${encoded}`,
+      `${base}/backend-api/projects/${encoded}?include=all`,
+      `${base}/backend-api/project/${encoded}`
+    ];
+    return fetchFirstSuccessfulJson(candidates, { authMode: 'auto' });
+  }
+
+  async function fetchProjectInstructions() {
+    const warnings = [];
+    const projectList = await fetchProjectList();
+    if (!projectList.length) {
+      return { items: [], warnings };
+    }
+
+    const merged = [];
+    for (const project of projectList) {
+      const current = {
+        projectId: project.id,
+        projectName: project.name,
+        instructions: project.instructions || '',
+        sourceUrl: project.sourceUrl || '',
+        updatedAt: project.updatedAt || ''
+      };
+
+      if (!current.instructions && current.projectId) {
+        try {
+          const { url, data } = await fetchProjectDetailById(current.projectId);
+          const detailMeta = normalizeProjectMeta(data || {}, 0);
+          current.instructions = current.instructions || detailMeta.instructions || '';
+          current.projectName = current.projectName || detailMeta.name || '';
+          current.updatedAt = current.updatedAt || detailMeta.updatedAt || '';
+          current.sourceUrl = url || current.sourceUrl || '';
+        } catch (err) {
+          warnings.push(
+            `Project detail fetch failed for ${current.projectName || current.projectId}: ${err?.message || err}`
+          );
+        }
+      }
+
+      merged.push(current);
+    }
+
+    const normalized = normalizeProjectInstructionItems(merged)
+      .filter((item) => !!item.instructions);
+    return { items: normalized, warnings };
+  }
+
+  async function fetchProjectConversationMetaPage(projectId, offset) {
+    const base = getConversationApiOrigin();
+    const encoded = encodeURIComponent(projectId);
+    const candidates = [
+      `${base}/backend-api/projects/${encoded}/conversations?offset=${offset}&limit=${FULL_SYNC_PAGE_SIZE}&order=updated`,
+      `${base}/backend-api/projects/${encoded}/conversations?offset=${offset}&limit=${FULL_SYNC_PAGE_SIZE}`,
+      `${base}/backend-api/project/${encoded}/conversations?offset=${offset}&limit=${FULL_SYNC_PAGE_SIZE}`,
+      `${base}/backend-api/projects/${encoded}/chats?offset=${offset}&limit=${FULL_SYNC_PAGE_SIZE}`
+    ];
+
+    let lastError = null;
+    for (const url of candidates) {
+      try {
+        const data = await fetchJson(url, { authMode: 'auto' });
+        const items = parseConversationListItems(data);
+        return {
+          items,
+          total: Number(data?.total || data?.data?.total || 0),
+          hasMore: Boolean(data?.has_missing_conversations || data?.has_more || data?.data?.has_more)
+        };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError || new Error(`Could not load project conversations for ${projectId}`);
+  }
+
+  async function fetchAllProjectConversationMetas(projectId) {
+    const all = [];
+    for (let page = 0; page < FULL_SYNC_MAX_PAGES; page++) {
+      const offset = page * FULL_SYNC_PAGE_SIZE;
+      const { items, total, hasMore } = await fetchProjectConversationMetaPage(projectId, offset);
+      if (!items.length) break;
+      all.push(...items);
+      if (items.length < FULL_SYNC_PAGE_SIZE && !hasMore) break;
+      if (total && all.length >= total) break;
+    }
+    return all;
+  }
+
+  async function fetchProjectConversationMetasForAllProjects() {
+    const warnings = [];
+    let projects = [];
+    try {
+      projects = await fetchProjectList();
+    } catch (err) {
+      return {
+        metas: [],
+        warnings: [`Project list fetch failed: ${err?.message || err}`]
+      };
+    }
+
+    const metas = [];
+    for (const project of projects) {
+      if (!project?.id) continue;
+      try {
+        const projectMetas = await fetchAllProjectConversationMetas(project.id);
+        for (const rawMeta of projectMetas) {
+          const normalized = normalizeConversationMeta(rawMeta);
+          if (!normalized.id) continue;
+          normalized.projectId = normalized.projectId || project.id;
+          normalized.projectName = normalized.projectName || project.name || '';
+          metas.push(normalized);
+        }
+      } catch (err) {
+        warnings.push(
+          `Project chat list fetch failed for ${project.name || project.id}: ${err?.message || err}`
+        );
+      }
+    }
+
+    return { metas, warnings };
+  }
+
   function collectSidebarChatIds() {
     const ids = new Set();
     const anchors = document.querySelectorAll('a[href*="/c/"]');
@@ -1145,7 +1802,24 @@
     return {
       id: cleanText(meta?.id || meta?.conversation_id || meta?.uuid || ''),
       title: cleanText(meta?.title || meta?.name || ''),
-      updatedAt: meta?.update_time || meta?.updated_at || meta?.create_time || meta?.created_at || null
+      updatedAt: meta?.update_time || meta?.updated_at || meta?.create_time || meta?.created_at || null,
+      url: cleanText(meta?.url || meta?.conversation_url || ''),
+      projectId: cleanText(
+        meta?.project_id ||
+        meta?.projectId ||
+        meta?.workspace_id ||
+        meta?.workspaceId ||
+        meta?.project?.id ||
+        ''
+      ),
+      projectName: cleanText(
+        meta?.project_name ||
+        meta?.projectName ||
+        meta?.workspace_name ||
+        meta?.workspaceName ||
+        meta?.project?.name ||
+        ''
+      )
     };
   }
 
@@ -1193,29 +1867,59 @@
       const message = node?.message;
       const role = cleanText(message?.author?.role || 'unknown').toLowerCase();
       const text = extractMessageTextContent(message?.content);
+      const urlSet = new Set([
+        ...extractUrlsFromText(text),
+        ...urlsFromUnknownPayload(message?.content),
+        ...urlsFromUnknownPayload(message?.metadata)
+      ]);
+      const urls = [...urlSet].filter((url) => /^https?:\/\//i.test(url));
 
-      if (!text) continue;
+      if (!text && !urls.length) continue;
       if (role === 'system') continue;
 
-      messages.push({ role, text });
+      messages.push({ role, text: text || '[non-text content]', urls });
     }
 
     return messages;
   }
 
-  async function fetchConversationById(chatId) {
+  async function fetchConversationById(chatId, meta = null) {
     const base = getConversationApiOrigin();
     const payload = await fetchJson(`${base}/backend-api/conversation/${chatId}`);
     const title = cleanText(payload?.title || 'Untitled Chat') || 'Untitled Chat';
     const messages = extractConversationMessages(payload);
+    const projectId = cleanText(
+      payload?.project_id ||
+      payload?.projectId ||
+      payload?.workspace_id ||
+      payload?.workspaceId ||
+      payload?.project?.id ||
+      meta?.projectId ||
+      ''
+    );
+    let projectName = cleanText(
+      payload?.project_name ||
+      payload?.projectName ||
+      payload?.workspace_name ||
+      payload?.workspaceName ||
+      payload?.project?.name ||
+      meta?.projectName ||
+      ''
+    );
+    if (!projectName) {
+      projectName = inferProjectNameFromTitle(title);
+    }
+    const urlFromMeta = cleanText(meta?.url || '');
 
     return {
       id: cleanText(payload?.conversation_id || payload?.id || chatId),
       title,
-      url: `${base}/c/${chatId}`,
+      url: urlFromMeta || `${base}/c/${chatId}`,
       updatedAt: payload?.update_time || payload?.create_time || new Date().toISOString(),
       summaryBullets: buildChatSummaryBullets({ title, messages }),
-      messages
+      messages,
+      projectId,
+      projectName
     };
   }
 
@@ -1262,23 +1966,57 @@
         console.warn('Conversation list fetch failed, falling back to sidebar IDs:', err);
         metas = collectSidebarChatIds().map((id) => ({ id, title: '', updatedAt: null }));
       }
-      if (!silent) setProgress(18, `Loaded ${metas.length} chat metadata records`);
+      if (!silent) setProgress(16, `Loaded ${metas.length} standard chat metadata records`);
+
+      try {
+        const projectMetaResult = await fetchProjectConversationMetasForAllProjects();
+        if (projectMetaResult?.metas?.length) {
+          metas.push(...projectMetaResult.metas);
+        }
+        if (Array.isArray(projectMetaResult?.warnings) && projectMetaResult.warnings.length) {
+          for (const warning of projectMetaResult.warnings) {
+            console.warn('Project chat metadata warning:', warning);
+          }
+        }
+      } catch (err) {
+        console.warn('Project chat metadata fetch failed:', err);
+      }
+      if (!silent) setProgress(22, `Loaded ${metas.length} total chat metadata records`);
 
       const uniqueMetas = [];
-      const seenIds = new Set();
+      const byId = new Map();
       for (const meta of metas) {
-        if (!meta?.id || seenIds.has(meta.id)) continue;
-        seenIds.add(meta.id);
-        uniqueMetas.push(meta);
+        if (!meta?.id) continue;
+        const existingMeta = byId.get(meta.id);
+        if (!existingMeta) {
+          byId.set(meta.id, { ...meta });
+          continue;
+        }
+
+        if (!existingMeta.title && meta.title) existingMeta.title = meta.title;
+        if (!existingMeta.url && meta.url) existingMeta.url = meta.url;
+        if (!existingMeta.projectId && meta.projectId) existingMeta.projectId = meta.projectId;
+        if (!existingMeta.projectName && meta.projectName) existingMeta.projectName = meta.projectName;
+
+        const existingTs = Date.parse(existingMeta.updatedAt || 0);
+        const incomingTs = Date.parse(meta.updatedAt || 0);
+        if (Number.isFinite(incomingTs) && incomingTs > existingTs) {
+          existingMeta.updatedAt = meta.updatedAt;
+        }
       }
+      uniqueMetas.push(...byId.values());
 
       const metasToFetch = [];
       for (const meta of uniqueMetas) {
         const existing = existingById.get(meta.id);
         const existingUpdatedAt = Date.parse(existing?.updatedAt || 0);
         const listedUpdatedAt = Date.parse(meta.updatedAt || 0);
+        const hasNewProjectLink =
+          (!existing?.projectId && !!meta?.projectId) ||
+          (!existing?.projectName && !!meta?.projectName);
         const shouldSkip =
           existing &&
+          !hasNewProjectLink &&
           (!Number.isFinite(listedUpdatedAt) || listedUpdatedAt <= existingUpdatedAt) &&
           (existing.messages?.length || 0) > 0;
 
@@ -1302,12 +2040,14 @@
 
           const meta = metasToFetch[index];
           try {
-            const chat = await fetchConversationById(meta.id);
+            const chat = await fetchConversationById(meta.id, meta);
             chat.accountLabel = activeAccountLabel;
             if (!chat.title && meta.title) chat.title = meta.title;
             if (!Number.isFinite(Date.parse(chat.updatedAt || 0)) && meta.updatedAt) {
               chat.updatedAt = meta.updatedAt;
             }
+            if (!chat.projectId && meta.projectId) chat.projectId = meta.projectId;
+            if (!chat.projectName && meta.projectName) chat.projectName = meta.projectName;
 
             await dbSet(chatStorageKey(activeAccountLabel, chat.id), chat);
             existingById.set(chat.id, chat);
@@ -1318,7 +2058,7 @@
             processedCount++;
             if (!silent) {
               const progressPct = metasToFetch.length
-                ? Math.round(18 + ((processedCount / metasToFetch.length) * 72))
+                ? Math.round(22 + ((processedCount / metasToFetch.length) * 68))
                 : 90;
               setProgress(progressPct, `Chat sync progress ${processedCount}/${metasToFetch.length}`);
             }
@@ -1333,8 +2073,13 @@
 
       if (!silent) setProgress(96, 'Rebuilding archive file...');
       await rebuildArchiveFile();
+      const projectLinkedCount = [...existingById.values()]
+        .filter((chat) => isProjectLinkedChat(chat))
+        .length;
       if (!silent || savedCount > 0) {
-        setStatus(`All-chat sync finished: ${savedCount} updated (${metasToFetch.length} checked)`);
+        setStatus(
+          `All-chat sync finished: ${savedCount} updated (${metasToFetch.length} checked, ${projectLinkedCount} project chats tracked)`
+        );
       }
       if (!silent) {
         setProgressDone(`Sync complete: ${savedCount} updated`);
@@ -1389,10 +2134,19 @@
 
   function parseArchiveChatBlock(block, accountLabel) {
     const lines = String(block || '').split('\n');
-    const title = cleanText(parseArchiveField(lines[0] || '', 'Title: '));
-    const chatId = cleanText(parseArchiveField(lines[1] || '', 'Chat ID: '));
-    const url = cleanText(parseArchiveField(lines[2] || '', 'URL: '));
-    const updatedAtRaw = cleanText(parseArchiveField(lines[3] || '', 'Last Updated: '));
+    const getField = (prefix) => {
+      for (const line of lines) {
+        if (line.startsWith(prefix)) return cleanText(parseArchiveField(line, prefix));
+      }
+      return '';
+    };
+
+    const title = getField('Title: ');
+    const chatId = getField('Chat ID: ');
+    const projectId = getField('Project ID: ');
+    const projectName = getField('Project Name: ');
+    const url = getField('URL: ');
+    const updatedAtRaw = getField('Last Updated: ');
 
     if (!chatId) return null;
 
@@ -1401,7 +2155,8 @@
       ? new Date(parsedUpdatedAt).toISOString()
       : new Date().toISOString();
 
-    let i = 4;
+    let i = 0;
+    while (i < lines.length && lines[i] !== '') i++;
     while (i < lines.length && !lines[i]) i++;
 
     const summaryBullets = [];
@@ -1469,7 +2224,9 @@
       url,
       updatedAt,
       summaryBullets,
-      messages
+      messages,
+      projectId,
+      projectName
     };
   }
 
@@ -1537,6 +2294,23 @@
       }
     }
 
+    const projectInstructionsRaw = extractMarkedBlock(
+      normalized,
+      '<<PROJECT_INSTRUCTIONS_JSON>>\n',
+      '\n<<END_PROJECT_INSTRUCTIONS_JSON>>'
+    );
+    let projectInstructions = [];
+    if (projectInstructionsRaw) {
+      try {
+        const parsedProjectInstructions = JSON.parse(projectInstructionsRaw);
+        if (Array.isArray(parsedProjectInstructions)) {
+          projectInstructions = normalizeProjectInstructionItems(parsedProjectInstructions);
+        }
+      } catch (err) {
+        // Ignore malformed legacy blocks.
+      }
+    }
+
     const enabled =
       enabledRaw === 'yes' ? true :
       enabledRaw === 'no' ? false :
@@ -1568,6 +2342,7 @@
         : '',
       memoriesLastError,
       memoriesSourceUrl,
+      projectInstructions,
       warnings: []
     };
   }
@@ -1694,7 +2469,8 @@
             ((existing?.memories?.length || 0) === 0 && (profile?.memories?.length || 0) > 0) ||
             (!existing?.customInstructions?.aboutUser && !!profile?.customInstructions?.aboutUser) ||
             (!existing?.customInstructions?.aboutModel && !!profile?.customInstructions?.aboutModel) ||
-            (!existing?.aboutYou?.text && !!profile?.aboutYou?.text);
+            (!existing?.aboutYou?.text && !!profile?.aboutYou?.text) ||
+            ((existing?.projectInstructions?.length || 0) === 0 && (profile?.projectInstructions?.length || 0) > 0);
 
           if (!shouldImport) continue;
 
@@ -1754,6 +2530,46 @@
       localStorage.setItem(LABEL_BINDINGS_KEY, JSON.stringify(bindings || {}));
     } catch {
       // Ignore localStorage failures and continue with in-memory state.
+    }
+  }
+
+  function getDefaultExportSettings() {
+    return {
+      includeSources: true,
+      includeMedia: true,
+      includeCode: true,
+      includeFiles: true,
+      autoDownloadAssets: true
+    };
+  }
+
+  function normalizeExportSettings(settings) {
+    const defaults = getDefaultExportSettings();
+    const input = settings && typeof settings === 'object' ? settings : {};
+    return {
+      includeSources: input.includeSources !== undefined ? !!input.includeSources : defaults.includeSources,
+      includeMedia: input.includeMedia !== undefined ? !!input.includeMedia : defaults.includeMedia,
+      includeCode: input.includeCode !== undefined ? !!input.includeCode : defaults.includeCode,
+      includeFiles: input.includeFiles !== undefined ? !!input.includeFiles : defaults.includeFiles,
+      autoDownloadAssets: input.autoDownloadAssets !== undefined ? !!input.autoDownloadAssets : defaults.autoDownloadAssets
+    };
+  }
+
+  function getExportSettings() {
+    try {
+      const raw = localStorage.getItem(EXPORT_SETTINGS_KEY);
+      if (!raw) return getDefaultExportSettings();
+      return normalizeExportSettings(JSON.parse(raw));
+    } catch {
+      return getDefaultExportSettings();
+    }
+  }
+
+  function saveExportSettings(settings) {
+    try {
+      localStorage.setItem(EXPORT_SETTINGS_KEY, JSON.stringify(normalizeExportSettings(settings)));
+    } catch {
+      // Ignore localStorage failures and continue with defaults.
     }
   }
 
@@ -1983,12 +2799,49 @@
     return match ? match[1] : null;
   }
 
+  function getCurrentProjectContextFromPath() {
+    const path = location.pathname || '';
+    const patterns = [
+      /\/projects\/([a-zA-Z0-9-]+)/i,
+      /\/project\/([a-zA-Z0-9-]+)/i,
+      /\/g\/p\/([a-zA-Z0-9-]+)/i
+    ];
+    for (const pattern of patterns) {
+      const match = path.match(pattern);
+      if (match && match[1]) {
+        return {
+          projectId: cleanText(match[1]),
+          projectName: ''
+        };
+      }
+    }
+    return { projectId: '', projectName: '' };
+  }
+
   function getCurrentChatTitle() {
     const h1 = document.querySelector('h1');
     if (h1 && cleanText(h1.innerText)) return cleanText(h1.innerText);
 
     const title = cleanText(document.title).replace(/\s*-\s*ChatGPT.*$/i, '');
     return title || 'Untitled Chat';
+  }
+
+  function inferProjectNameFromTitle(title) {
+    const value = cleanText(title || '');
+    if (!value) return '';
+    const match = value.match(/^chatgpt\s*[-:|]\s*(.+)$/i);
+    return match ? cleanText(match[1]) : '';
+  }
+
+  function getChatProjectName(chat) {
+    return cleanText(chat?.projectName || '') || inferProjectNameFromTitle(chat?.title || '');
+  }
+
+  function isProjectLinkedChat(chat) {
+    return !!(
+      cleanText(chat?.projectId || '') ||
+      getChatProjectName(chat)
+    );
   }
 
   function getMessageNodes() {
@@ -2000,9 +2853,20 @@
       .map((node) => {
         const role = node.getAttribute('data-message-author-role') || 'unknown';
         const text = cleanText(node.innerText);
-        return { role, text };
+        const urlSet = new Set([
+          ...extractUrlsFromText(text),
+          ...[...node.querySelectorAll('a[href]')].map((el) => cleanText(el.getAttribute('href') || el.href || '')),
+          ...[...node.querySelectorAll('img[src]')].map((el) => cleanText(el.getAttribute('src') || '')),
+          ...[...node.querySelectorAll('source[src]')].map((el) => cleanText(el.getAttribute('src') || ''))
+        ]);
+        const urls = [...urlSet].filter((url) => /^https?:\/\//i.test(url));
+        return {
+          role,
+          text: text || (urls.length ? '[non-text content]' : ''),
+          urls
+        };
       })
-      .filter((m) => m.text);
+      .filter((m) => m.text || (Array.isArray(m.urls) && m.urls.length));
   }
 
   async function captureCurrentChat() {
@@ -2034,8 +2898,12 @@
         title,
         messages
       }),
-      messages
+      messages,
+      ...getCurrentProjectContextFromPath()
     };
+    if (!chat.projectName) {
+      chat.projectName = getChatProjectName(chat);
+    }
 
     await dbSet(chatStorageKey(activeAccountLabel, chatId), chat);
     await rebuildArchiveFile();
@@ -2063,6 +2931,9 @@
     const customInstructions = profile?.customInstructions || {};
     const aboutYou = profile?.aboutYou || {};
     const memories = Array.isArray(profile?.memories) ? profile.memories : [];
+    const projectInstructions = normalizeProjectInstructionItems(
+      Array.isArray(profile?.projectInstructions) ? profile.projectInstructions : []
+    );
 
     lines.push('################################################################');
     lines.push('PROFILE');
@@ -2078,6 +2949,7 @@
     ));
     lines.push('Memories Last Successful Sync: ' + (profile?.memoriesLastSuccessfulSyncAt || ''));
     lines.push('Memories Last Error: ' + (profile?.memoriesLastError || ''));
+    lines.push('Project Instructions Count: ' + projectInstructions.length);
     lines.push('<<CUSTOM_INSTRUCTIONS_ABOUT_USER>>');
     lines.push(customInstructions?.aboutUser || '');
     lines.push('<<END_CUSTOM_INSTRUCTIONS_ABOUT_USER>>');
@@ -2106,6 +2978,11 @@
     }
 
     lines.push('');
+    lines.push('<<PROJECT_INSTRUCTIONS_JSON>>');
+    lines.push(JSON.stringify(projectInstructions, null, 2));
+    lines.push('<<END_PROJECT_INSTRUCTIONS_JSON>>');
+
+    lines.push('');
     return lines.join('\n');
   }
 
@@ -2120,6 +2997,8 @@
     lines.push('################################################################');
     lines.push('Title: ' + (chat.title || 'Untitled Chat'));
     lines.push('Chat ID: ' + (chat.id || ''));
+    lines.push('Project ID: ' + (chat.projectId || ''));
+    lines.push('Project Name: ' + getChatProjectName(chat));
     lines.push('URL: ' + (chat.url || ''));
     lines.push('Last Updated: ' + formatTimestamp(chat.updatedAt));
     lines.push('');
@@ -2138,6 +3017,13 @@
       lines.push('[' + (i + 1) + '] ' + String(m.role || 'unknown').toUpperCase());
       lines.push('------------------------------------------------------------');
       lines.push(m.text || '');
+      if (Array.isArray(m.urls) && m.urls.length) {
+        lines.push('');
+        lines.push('Referenced URLs:');
+        for (const url of m.urls) {
+          lines.push('- ' + url);
+        }
+      }
       lines.push('');
     }
 
@@ -2188,6 +3074,20 @@
       out.push('############################################################');
       out.push('ACCOUNT: ' + label);
       out.push('Tracked chats: ' + accountChats.length);
+      const trackedProjectChats = accountChats.filter((chat) => isProjectLinkedChat(chat));
+      out.push('Tracked project chats: ' + trackedProjectChats.length);
+      if (trackedProjectChats.length) {
+        out.push('Tracked project chat list:');
+        for (const chat of trackedProjectChats) {
+          const projectName = getChatProjectName(chat);
+          const projectId = cleanText(chat?.projectId || '');
+          let projectLabel = projectName || '(unknown project)';
+          if (projectId) {
+            projectLabel += ` [${projectId}]`;
+          }
+          out.push(`- ${(chat?.title || 'Untitled Chat')} | Chat ID: ${chat?.id || ''} | Project: ${projectLabel}`);
+        }
+      }
       out.push('############################################################');
       out.push('');
 
@@ -2214,6 +3114,267 @@
     if (text === lastRenderedArchive) return;
     lastRenderedArchive = text;
     await writeArchiveText(text);
+  }
+
+  async function exportArchiveBundleToFolder() {
+    const folderHandle = await getSavedBundleFolderHandle();
+    if (!folderHandle) {
+      setStatus('Choose bundle folder first');
+      return;
+    }
+
+    const hasPermission = await ensureWritePermission(folderHandle);
+    if (!hasPermission) {
+      setStatus('Bundle folder permission denied');
+      return;
+    }
+
+    await maybeImportArchiveFromFile();
+    setProgress(0, 'Preparing bundle export...', { indeterminate: true });
+
+    try {
+      const exportSettings = getExportSettings();
+      const includeSources = !!exportSettings.includeSources;
+      const includeMedia = !!exportSettings.includeMedia;
+      const includeCode = !!exportSettings.includeCode;
+      const includeFiles = !!exportSettings.includeFiles;
+      const autoDownloadAssets = !!exportSettings.autoDownloadAssets;
+
+      const chats = await dbGetAllChats();
+      const profiles = await dbGetAllProfiles();
+      const archiveText = await renderFullArchive();
+
+      const mediaDir = includeMedia ? await folderHandle.getDirectoryHandle('media', { create: true }) : null;
+      const sourcesDir = includeSources ? await folderHandle.getDirectoryHandle('sources', { create: true }) : null;
+      const codeDir = includeCode ? await folderHandle.getDirectoryHandle('code', { create: true }) : null;
+      const filesDir = includeFiles ? await folderHandle.getDirectoryHandle('files', { create: true }) : null;
+
+      setProgress(14, 'Writing archive.txt...');
+      await writeTextFileInFolder(folderHandle, 'archive.txt', archiveText);
+
+      setProgress(26, 'Collecting sources/media/code...');
+      const artifacts = await collectBundleArtifacts(chats, profiles);
+      const chatsDir = await folderHandle.getDirectoryHandle('chats', { create: true });
+
+      if (includeSources && sourcesDir) {
+        await writeTextFileInFolder(sourcesDir, 'sources.txt', buildBundleUrlReport(artifacts, 'sources'));
+      }
+
+      if (includeMedia && mediaDir) {
+        await writeTextFileInFolder(mediaDir, 'media-index.txt', buildBundleUrlReport(artifacts, 'media'));
+      }
+
+      if (includeFiles && filesDir) {
+        await writeTextFileInFolder(filesDir, 'files-index.txt', buildBundleUrlReport(artifacts, 'files'));
+      }
+
+      if (includeCode && codeDir) {
+        const codeLines = ['# Code Blocks', ''];
+        for (let i = 0; i < artifacts.codeBlocks.length; i++) {
+          const block = artifacts.codeBlocks[i];
+          codeLines.push(`## Snippet ${i + 1}`);
+          codeLines.push(`Context: ${block.context || 'Unknown'}`);
+          codeLines.push('');
+          codeLines.push(`\`\`\`${block.lang || ''}`);
+          codeLines.push(block.code);
+          codeLines.push('```');
+          codeLines.push('');
+        }
+        if (!artifacts.codeBlocks.length) {
+          codeLines.push('(No code blocks found)');
+        }
+        await writeTextFileInFolder(codeDir, 'code-snippets.md', codeLines.join('\n'));
+      }
+
+      const downloadManifest = [];
+      const totalChatAssets = autoDownloadAssets
+        ? artifacts.perChat.reduce(
+          (sum, chatEntry) => sum +
+            (includeMedia ? chatEntry.mediaUrls.length : 0) +
+            (includeFiles ? chatEntry.fileUrls.length : 0),
+          0
+        )
+        : 0;
+      let downloadedAssets = 0;
+
+      for (let chatIndex = 0; chatIndex < artifacts.perChat.length; chatIndex++) {
+        const chatEntry = artifacts.perChat[chatIndex];
+        const folderStem = sanitizeFilename(
+          `${String(chatIndex + 1).padStart(4, '0')}-${chatEntry.chatTitle || 'chat'}-${String(chatEntry.chatId || '').slice(0, 8)}`,
+          `chat-${chatIndex + 1}`
+        ).slice(0, 96);
+        const chatDir = await chatsDir.getDirectoryHandle(folderStem, { create: true });
+        const chatMediaDir = includeMedia ? await chatDir.getDirectoryHandle('media', { create: true }) : null;
+        const chatFilesDir = includeFiles ? await chatDir.getDirectoryHandle('files', { create: true }) : null;
+
+        setProgress(34, `Writing chat bundle ${chatIndex + 1}/${artifacts.perChat.length}`);
+        await writeTextFileInFolder(chatDir, 'transcript.txt', renderChatTranscriptText(chatEntry.chat));
+
+        if (includeSources) {
+          const chatSourcesLines = [
+            '# Chat Sources',
+            `Chat: ${chatEntry.chatTitle || 'Untitled Chat'}`,
+            `Chat ID: ${chatEntry.chatId || ''}`,
+            '',
+            ...chatEntry.sourceUrls.map((url) => `- ${url}`),
+            '',
+            `Total: ${chatEntry.sourceUrls.length}`
+          ];
+          await writeTextFileInFolder(chatDir, 'sources.txt', chatSourcesLines.join('\n'));
+        }
+
+        if (includeMedia) {
+          const chatMediaLines = [
+            '# Chat Media URLs',
+            `Chat: ${chatEntry.chatTitle || 'Untitled Chat'}`,
+            `Chat ID: ${chatEntry.chatId || ''}`,
+            '',
+            ...chatEntry.mediaUrls.map((url) => `- ${url}`),
+            '',
+            `Total: ${chatEntry.mediaUrls.length}`
+          ];
+          await writeTextFileInFolder(chatDir, 'media-urls.txt', chatMediaLines.join('\n'));
+        }
+
+        if (includeFiles) {
+          const chatFileLines = [
+            '# Chat File URLs',
+            `Chat: ${chatEntry.chatTitle || 'Untitled Chat'}`,
+            `Chat ID: ${chatEntry.chatId || ''}`,
+            '',
+            ...chatEntry.fileUrls.map((url) => `- ${url}`),
+            '',
+            `Total: ${chatEntry.fileUrls.length}`
+          ];
+          await writeTextFileInFolder(chatDir, 'file-urls.txt', chatFileLines.join('\n'));
+        }
+
+        if (includeCode) {
+          const chatCodeLines = ['# Chat Code Blocks', ''];
+          for (let i = 0; i < chatEntry.codeBlocks.length; i++) {
+            const block = chatEntry.codeBlocks[i];
+            chatCodeLines.push(`## Snippet ${i + 1}`);
+            chatCodeLines.push(`Context: ${block.context || 'Unknown'}`);
+            chatCodeLines.push('');
+            chatCodeLines.push(`\`\`\`${block.lang || ''}`);
+            chatCodeLines.push(block.code);
+            chatCodeLines.push('```');
+            chatCodeLines.push('');
+          }
+          if (!chatEntry.codeBlocks.length) {
+            chatCodeLines.push('(No code blocks found)');
+          }
+          await writeTextFileInFolder(chatDir, 'code-snippets.md', chatCodeLines.join('\n'));
+        }
+
+        const perChatManifest = [];
+        const chatTargets = autoDownloadAssets
+          ? [
+            ...(includeMedia ? chatEntry.mediaUrls.map((url) => ({ kind: 'media', url })) : []),
+            ...(includeFiles ? chatEntry.fileUrls.map((url) => ({ kind: 'files', url })) : [])
+          ]
+          : [];
+
+        if (!autoDownloadAssets) {
+          const manifestRow = {
+            chatId: chatEntry.chatId,
+            chatFolder: folderStem,
+            kind: 'meta',
+            status: 'skipped',
+            note: 'Asset download skipped by export settings'
+          };
+          perChatManifest.push(manifestRow);
+          downloadManifest.push(manifestRow);
+        }
+
+        for (let i = 0; i < chatTargets.length; i++) {
+          const target = chatTargets[i];
+          downloadedAssets++;
+          const pct = totalChatAssets
+            ? 40 + Math.round((downloadedAssets / totalChatAssets) * 56)
+            : 96;
+          setProgress(pct, `Downloading chat assets ${downloadedAssets}/${Math.max(1, totalChatAssets)}`);
+
+          const targetDir = target.kind === 'media' ? chatMediaDir : chatFilesDir;
+          if (!targetDir) continue;
+          const baseName = getUrlFileBaseName(target.url, `${target.kind}-${i + 1}`);
+          try {
+            const fetched = await fetchAssetBlob(target.url);
+            const ext = extensionFromUrl(target.url) || extensionFromMime(fetched.contentType) || '.bin';
+            const fileName = sanitizeFilename(
+              `${String(i + 1).padStart(3, '0')}-${baseName}${ext}`,
+              `${target.kind}-${i + 1}${ext}`
+            );
+            await writeBlobFileInFolder(targetDir, fileName, fetched.blob);
+            const manifestRow = {
+              chatId: chatEntry.chatId,
+              chatFolder: folderStem,
+              url: target.url,
+              kind: target.kind,
+              status: 'saved',
+              fileName
+            };
+            perChatManifest.push(manifestRow);
+            downloadManifest.push(manifestRow);
+          } catch (err) {
+            const manifestRow = {
+              chatId: chatEntry.chatId,
+              chatFolder: folderStem,
+              url: target.url,
+              kind: target.kind,
+              status: 'failed',
+              error: cleanText(err?.message || String(err))
+            };
+            perChatManifest.push(manifestRow);
+            downloadManifest.push(manifestRow);
+          }
+        }
+
+        await writeTextFileInFolder(chatDir, 'download-manifest.json', JSON.stringify({
+          chatId: chatEntry.chatId,
+          chatTitle: chatEntry.chatTitle,
+          totalTargets: chatTargets.length,
+          downloads: perChatManifest
+        }, null, 2));
+      }
+
+      if (!autoDownloadAssets) {
+        downloadManifest.push({
+          kind: 'meta',
+          status: 'skipped',
+          note: 'Global asset download skipped by export settings'
+        });
+      }
+
+      if (!totalChatAssets) {
+        setProgress(96, 'Finalizing bundle manifest...');
+      }
+
+      await writeTextFileInFolder(folderHandle, 'bundle-manifest.json', JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        chats: chats.length,
+        profiles: profiles.length,
+        sources: artifacts.sourceUrls.length,
+        mediaUrls: artifacts.mediaUrls.length,
+        fileUrls: artifacts.fileUrls.length,
+        codeBlocks: artifacts.codeBlocks.length,
+        perChatBundles: artifacts.perChat.length,
+        settings: {
+          includeSources,
+          includeMedia,
+          includeCode,
+          includeFiles,
+          autoDownloadAssets
+        },
+        downloads: downloadManifest
+      }, null, 2));
+
+      setStatus('Bundle export complete: settings applied for sources/media/code/files');
+      setProgressDone('Bundle export complete');
+    } catch (err) {
+      setProgressFailed('Bundle export failed');
+      setStatus(`Bundle export failed: ${err?.message || err}`);
+    }
   }
 
   // ============================================================
@@ -2340,7 +3501,7 @@
     return importWizardData.accounts.find((acc) => acc.label === selectedLabel) || importWizardData.accounts[0];
   }
 
-  function getComposerTextarea() {
+  function getComposerInput() {
     return document.querySelector('#prompt-textarea')
       || document.querySelector('textarea[data-id="root"]')
       || document.querySelector('main textarea')
@@ -2349,19 +3510,77 @@
 
   function getSendButton() {
     return document.querySelector('button[data-testid="send-button"]')
+      || document.querySelector('button[data-testid="fruitjuice-send-button"]')
+      || document.querySelector('button[aria-label="Send prompt"]')
+      || document.querySelector('button[aria-label^="Send"]')
       || document.querySelector('button[aria-label*="Send"]')
       || document.querySelector('button[aria-label*="send"]')
+      || document.querySelector('form button[type="submit"]')
       || null;
   }
 
-  function setTextareaValue(textarea, value) {
-    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(textarea), 'value');
-    if (descriptor?.set) {
-      descriptor.set.call(textarea, value);
-    } else {
-      textarea.value = value;
+  function readComposerInputValue(inputEl) {
+    if (!inputEl) return '';
+    if (typeof inputEl.value === 'string') return inputEl.value;
+    return inputEl.innerText || inputEl.textContent || '';
+  }
+
+  function clearContentEditable(el) {
+    if (!el) return;
+    try {
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (document.execCommand) {
+        document.execCommand('delete', false);
+      }
+      selection.removeAllRanges();
+    } catch {
+      // Fallback below.
     }
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    el.textContent = '';
+  }
+
+  function setComposerInputValue(inputEl, value) {
+    const text = String(value || '');
+    const isTextAreaLike = typeof inputEl.value === 'string';
+
+    if (isTextAreaLike) {
+      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(inputEl), 'value');
+      if (descriptor?.set) {
+        descriptor.set.call(inputEl, text);
+      } else {
+        inputEl.value = text;
+      }
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      return;
+    }
+
+    clearContentEditable(inputEl);
+    inputEl.focus();
+    if (document.execCommand) {
+      try {
+        document.execCommand('insertText', false, text);
+      } catch {
+        // Fallback below.
+      }
+    }
+    if (!cleanText(readComposerInputValue(inputEl))) {
+      inputEl.textContent = text;
+    }
+    try {
+      inputEl.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: text
+      }));
+    } catch {
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    }
   }
 
   async function waitFor(fn, timeoutMs = 120000, intervalMs = 200) {
@@ -2376,8 +3595,8 @@
 
   async function waitForComposerAvailability(timeoutMs = 180000) {
     return waitFor(() => {
-      const textarea = getComposerTextarea();
-      if (!textarea || textarea.disabled) return null;
+      const inputEl = getComposerInput();
+      if (!inputEl || inputEl.disabled) return null;
 
       const button = getSendButton();
       if (button) {
@@ -2386,15 +3605,21 @@
         if (label.includes('stop')) return null;
       }
 
-      return textarea;
+      return inputEl;
     }, timeoutMs, 250);
   }
 
   async function sendComposerMessage(text) {
-    const textarea = await waitForComposerAvailability();
-    textarea.focus();
-    setTextareaValue(textarea, text);
+    const inputEl = await waitForComposerAvailability();
+    inputEl.focus();
+    setComposerInputValue(inputEl, text);
     await sleep(120);
+    await waitFor(() => {
+      const button = getSendButton();
+      if (!button || button.disabled) return false;
+      const label = `${button.getAttribute('aria-label') || ''} ${button.innerText || ''}`.toLowerCase();
+      return !label.includes('stop');
+    }, 8000, 120).catch(() => true);
 
     let sent = false;
     const sendButton = getSendButton();
@@ -2404,7 +3629,7 @@
     }
 
     if (!sent) {
-      textarea.dispatchEvent(new KeyboardEvent('keydown', {
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter',
         code: 'Enter',
         which: 13,
@@ -2420,8 +3645,8 @@
 
     await sleep(250);
     await waitFor(() => {
-      const el = getComposerTextarea();
-      return el && !cleanText(el.value || '');
+      const el = getComposerInput();
+      return el && !cleanText(readComposerInputValue(el));
     }, 15000, 200).catch(() => true);
   }
 
@@ -2430,6 +3655,8 @@
     lines.push(`===== IMPORTED CHAT ${index + 1} =====`);
     lines.push(`Title: ${chat?.title || 'Untitled Chat'}`);
     lines.push(`Chat ID: ${chat?.id || ''}`);
+    lines.push(`Project ID: ${chat?.projectId || ''}`);
+    lines.push(`Project Name: ${getChatProjectName(chat)}`);
     lines.push(`URL: ${chat?.url || ''}`);
     lines.push(`Last Updated: ${formatTimestamp(chat?.updatedAt || '')}`);
     lines.push('');
@@ -2438,8 +3665,22 @@
     for (const message of messages) {
       lines.push(`[${String(message?.role || 'unknown').toUpperCase()}]`);
       lines.push(message?.text || '');
+      if (Array.isArray(message?.urls) && message.urls.length) {
+        lines.push('');
+        lines.push('Referenced URLs:');
+        for (const url of message.urls) {
+          lines.push(`- ${url}`);
+        }
+      }
       lines.push('');
     }
+
+    lines.push('----- POST-IMPORT INSTRUCTIONS -----');
+    lines.push('1) Summarize the imported chat above in 5 concise bullets.');
+    lines.push('2) Then continue the conversation naturally from the last user turn.');
+    lines.push('3) Do not mention that this was an import; just continue as normal.');
+    lines.push('-----------------------------------');
+    lines.push('');
 
     return lines.join('\n');
   }
@@ -2472,6 +3713,85 @@
     }
 
     return chunks;
+  }
+
+  function splitTextIntoChunks(text, maxChars = 12000) {
+    const normalized = String(text || '');
+    if (!normalized) return [];
+    if (normalized.length <= maxChars) return [normalized];
+
+    const lines = normalized.split('\n');
+    const chunks = [];
+    let current = '';
+
+    for (const line of lines) {
+      const candidate = current ? `${current}\n${line}` : line;
+      if (candidate.length <= maxChars) {
+        current = candidate;
+        continue;
+      }
+
+      if (current) {
+        chunks.push(current);
+      }
+
+      if (line.length <= maxChars) {
+        current = line;
+        continue;
+      }
+
+      for (let i = 0; i < line.length; i += maxChars) {
+        const piece = line.slice(i, i + maxChars);
+        if (piece) chunks.push(piece);
+      }
+      current = '';
+    }
+
+    if (current) chunks.push(current);
+    return chunks.filter((chunk) => cleanText(chunk));
+  }
+
+  function buildSingleChatImportChunks(chat, sourceLabel, chatIndex, totalChats, maxChars = 12000) {
+    const header = [
+      `Imported chat ${chatIndex + 1} of ${totalChats} from account label: ${sourceLabel}`,
+      `Imported on: ${new Date().toLocaleString()}`,
+      '',
+      'This thread contains one restored archived chat.',
+      ''
+    ].join('\n');
+    const body = renderImportedChat(chat, chatIndex);
+    const fullText = `${header}\n${body}\n`;
+    return splitTextIntoChunks(fullText, maxChars);
+  }
+
+  function getNewChatButton() {
+    return document.querySelector('button[data-testid="new-chat-button"]')
+      || document.querySelector('a[data-testid="new-chat-button"]')
+      || document.querySelector('button[aria-label*="New chat"]')
+      || document.querySelector('a[aria-label*="New chat"]')
+      || document.querySelector('a[href="/"]')
+      || document.querySelector('button[aria-label*="new chat"]')
+      || document.querySelector('a[aria-label*="new chat"]')
+      || null;
+  }
+
+  async function openNewChatThreadForImport() {
+    const beforePath = location.pathname;
+    const btn = getNewChatButton();
+    if (btn) {
+      btn.click();
+    } else {
+      location.assign('/');
+    }
+
+    await sleep(300);
+    await waitFor(() => {
+      const inputEl = getComposerInput();
+      if (!inputEl || inputEl.disabled) return null;
+      if (location.pathname !== beforePath) return inputEl;
+      if (location.pathname === '/') return inputEl;
+      return inputEl;
+    }, 60000, 250);
   }
 
   function buildCustomInstructionPayloads(customInstructions, aboutYouText = '') {
@@ -2527,6 +3847,148 @@
     throw new Error(errors.slice(-10).join(' || ') || 'Could not apply custom instructions');
   }
 
+  function buildMemoryImportPayloads(memoryText) {
+    return [
+      { text: memoryText },
+      { memory: memoryText },
+      { content: memoryText },
+      { message: memoryText },
+      { memory_text: memoryText },
+      { data: { text: memoryText } }
+    ];
+  }
+
+  async function applySingleMemoryToCurrentAccount(memoryText) {
+    const normalized = squeezeWhitespace(memoryText || '');
+    if (!normalized) return { endpoint: '', method: '', skipped: true };
+
+    const base = getConversationApiOrigin();
+    const endpoints = [
+      `${base}/backend-api/memories`,
+      `${base}/backend-api/memory`,
+      `${base}/backend-api/memories/add`
+    ];
+    const methods = ['POST', 'PUT', 'PATCH'];
+    const payloads = buildMemoryImportPayloads(normalized);
+    const errors = [];
+
+    for (const endpoint of endpoints) {
+      for (const method of methods) {
+        for (const payload of payloads) {
+          try {
+            await fetchJson(endpoint, {
+              method,
+              authMode: 'auto',
+              headers: {
+                'content-type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+            return { endpoint, method, skipped: false };
+          } catch (err) {
+            errors.push(`${method} ${endpoint} => ${err?.message || err}`);
+          }
+        }
+      }
+    }
+
+    throw new Error(errors.slice(-12).join(' || ') || 'Could not import memory');
+  }
+
+  async function importMemoriesToCurrentAccount(memories) {
+    const sourceMemories = dedupeMemories(
+      asArray(memories)
+        .map((memory, index) => normalizeMemoryItem(memory, index))
+        .filter(Boolean)
+    );
+    if (!sourceMemories.length) {
+      return { imported: 0, skipped: 0, failed: 0, errors: [] };
+    }
+
+    let existing = [];
+    try {
+      const fetched = await fetchMemories();
+      existing = asArray(fetched?.items);
+    } catch {
+      existing = [];
+    }
+
+    const existingSet = new Set(
+      existing
+        .map((entry) => squeezeWhitespace(entry?.text || '').toLowerCase())
+        .filter(Boolean)
+    );
+
+    const toImport = sourceMemories.filter((entry) => !existingSet.has((entry.text || '').toLowerCase()));
+    if (!toImport.length) {
+      return { imported: 0, skipped: sourceMemories.length, failed: 0, errors: [] };
+    }
+
+    let imported = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (const memory of toImport) {
+      try {
+        await applySingleMemoryToCurrentAccount(memory.text);
+        imported++;
+      } catch (err) {
+        failed++;
+        errors.push(cleanText(err?.message || String(err)));
+      }
+      await sleep(260);
+    }
+
+    return {
+      imported,
+      skipped: sourceMemories.length - toImport.length,
+      failed,
+      errors
+    };
+  }
+
+  async function importWizardImportMemories() {
+    if (importInProgress) return;
+    const selected = getImportSelection();
+    const memoryItems = asArray(selected?.profile?.memories);
+    if (!memoryItems.length) {
+      throw new Error('No memories found for selected account');
+    }
+
+    const proceed = confirm(
+      `Import ${memoryItems.length} saved memories from "${selected.label}" into this account?\n\n` +
+      'Existing matching memories will be skipped.'
+    );
+    if (!proceed) return;
+
+    importInProgress = true;
+    updateImportWizardUi();
+    try {
+      setProgress(0, `Importing memories from ${selected.label}...`, { indeterminate: true });
+      setStatus(`Importing memories from ${selected.label}...`);
+      const result = await importMemoriesToCurrentAccount(memoryItems);
+
+      if (result.failed > 0 && result.imported === 0) {
+        setProgressFailed('Memory import failed');
+      } else {
+        setProgressDone(`Memories imported: ${result.imported}`);
+      }
+
+      setStatus(
+        `Memory import done: imported ${result.imported}, skipped ${result.skipped}, failed ${result.failed}`
+      );
+      if (result.failed > 0) {
+        console.warn('Memory import errors:', result.errors);
+      }
+    } catch (err) {
+      setProgressFailed('Memory import failed');
+      throw err;
+    } finally {
+      importInProgress = false;
+      updateImportWizardUi();
+    }
+  }
+
   function updateImportWizardUi() {
     const modal = document.getElementById('cgpt-archive-import-modal');
     if (!modal) return;
@@ -2535,10 +3997,13 @@
     const fileEl = modal.querySelector('#cgpt-import-source-file');
     const summaryEl = modal.querySelector('#cgpt-import-summary');
     const btnApply = modal.querySelector('#cgpt-import-apply-ci');
+    const btnMemories = modal.querySelector('#cgpt-import-import-memories');
     const btnImport = modal.querySelector('#cgpt-import-import-chats');
+    const btnImportSeparate = modal.querySelector('#cgpt-import-import-chats-separate');
+    const btnCleanupSource = modal.querySelector('#cgpt-import-cleanup-source-chats');
     const btnRunAll = modal.querySelector('#cgpt-import-run-all');
 
-    if (!select || !fileEl || !summaryEl || !btnApply || !btnImport || !btnRunAll) return;
+    if (!select || !fileEl || !summaryEl || !btnApply || !btnMemories || !btnImport || !btnImportSeparate || !btnCleanupSource || !btnRunAll) return;
 
     select.innerHTML = '';
     const accounts = importWizardData?.accounts || [];
@@ -2550,7 +4015,10 @@
       select.appendChild(option);
       select.disabled = true;
       btnApply.disabled = true;
+      btnMemories.disabled = true;
       btnImport.disabled = true;
+      btnImportSeparate.disabled = true;
+      btnCleanupSource.disabled = true;
       btnRunAll.disabled = true;
       fileEl.textContent = importWizardData?.sourceFileName || '(none loaded)';
       summaryEl.innerHTML = 'Load an archive TXT to begin.';
@@ -2570,9 +4038,11 @@
 
     const selected = getImportSelection();
     const profile = selected?.profile;
+    const hasSelectedAccount = !!selected?.label;
     const hasCustomInstructions = !!(profile?.customInstructions?.aboutUser || profile?.customInstructions?.aboutModel);
     const hasAboutYou = !!profile?.aboutYou?.text;
     const memoryCount = Array.isArray(profile?.memories) ? profile.memories.length : 0;
+    const projectInstructionCount = Array.isArray(profile?.projectInstructions) ? profile.projectInstructions.length : 0;
 
     fileEl.textContent = importWizardData?.sourceFileName || '(unnamed file)';
     summaryEl.innerHTML =
@@ -2581,11 +4051,15 @@
       `Custom instructions in archive: <b>${hasCustomInstructions ? 'yes' : 'no'}</b><br>` +
       `About You in archive: <b>${hasAboutYou ? 'yes' : 'no'}</b><br>` +
       `Memories in archive: <b>${memoryCount}</b><br>` +
+      `Project instructions in archive: <b>${projectInstructionCount}</b><br>` +
       `Import status: <b>${importInProgress ? 'running' : 'idle'}</b>`;
 
     select.disabled = false;
     btnApply.disabled = !hasCustomInstructions || importInProgress;
+    btnMemories.disabled = !(memoryCount > 0) || importInProgress;
     btnImport.disabled = !(selected?.chats?.length > 0) || importInProgress;
+    btnImportSeparate.disabled = !(selected?.chats?.length > 0) || importInProgress;
+    btnCleanupSource.disabled = !hasSelectedAccount || importInProgress;
     btnRunAll.disabled = importInProgress;
   }
 
@@ -2681,7 +4155,8 @@
     const chunks = buildImportChunks(selected.chats, selected.label);
     const proceed = confirm(
       `Import ${selected.chats.length} chats from "${selected.label}" as ${chunks.length} message chunk(s) into this account?\n\n` +
-      'This will send messages in the currently open chat.'
+      'This will send messages in the currently open chat.\n\n' +
+      'Warning: this can take a few minutes for larger archives.'
     );
     if (!proceed) return;
 
@@ -2707,6 +4182,176 @@
     }
   }
 
+  async function importWizardImportChatsSeparateThreads() {
+    if (importInProgress) return;
+    const selected = getImportSelection();
+    const chats = Array.isArray(selected?.chats) ? selected.chats : [];
+    if (!chats.length) {
+      throw new Error('No chats found for selected account');
+    }
+
+    const proceed = confirm(
+      `Import ${chats.length} chats from "${selected.label}" into separate new ChatGPT threads?\n\n` +
+      'This opens a new chat and sends one archived chat per thread.\n\n' +
+      'Warning: this can take several minutes for larger archives.'
+    );
+    if (!proceed) return;
+
+    importInProgress = true;
+    updateImportWizardUi();
+    try {
+      for (let i = 0; i < chats.length; i++) {
+        const pct = Math.round((i / chats.length) * 100);
+        setProgress(pct, `Preparing thread ${i + 1}/${chats.length}`);
+        setStatus(`Opening new thread ${i + 1}/${chats.length}...`);
+        await openNewChatThreadForImport();
+
+        const chunks = buildSingleChatImportChunks(chats[i], selected.label, i, chats.length);
+        if (!chunks.length) continue;
+
+        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+          const chunkText = chunks[chunkIndex];
+          const chunkLabel = chunks.length > 1
+            ? `thread ${i + 1}/${chats.length}, part ${chunkIndex + 1}/${chunks.length}`
+            : `thread ${i + 1}/${chats.length}`;
+          setStatus(`Importing ${chunkLabel}...`);
+          await sendComposerMessage(chunkText);
+          await sleep(500);
+          await waitForComposerAvailability();
+        }
+
+        await sleep(500);
+      }
+
+      setStatus(`Separate-thread import complete: ${chats.length} chats imported`);
+      setProgressDone(`Separate-thread import complete: ${chats.length}`);
+    } catch (err) {
+      setProgressFailed('Separate-thread chat import failed');
+      throw err;
+    } finally {
+      importInProgress = false;
+      updateImportWizardUi();
+    }
+  }
+
+  async function importWizardPurgeSourceChats() {
+    if (importInProgress) return;
+    const allChats = await dbGetAllChats();
+    const allProfiles = await dbGetAllProfiles();
+    const bindings = getLabelBindings();
+    const labels = new Set(
+      [
+        ...(importWizardData?.accounts || []).map((account) => normalizeAccountLabel(account?.label || '')),
+        ...allChats.map((chat) => normalizeAccountLabel(chat?.accountLabel || '')),
+        ...allProfiles.map((profile) => normalizeAccountLabel(profile?.accountLabel || '')),
+        ...Object.keys(bindings || {}).map((label) => normalizeAccountLabel(label || ''))
+      ].filter(Boolean)
+    );
+    const knownLabels = [...labels].sort((a, b) => a.localeCompare(b));
+
+    if (!knownLabels.length) {
+      setStatus('No source account labels found for cleanup');
+      return;
+    }
+
+    const defaultLabel = normalizeAccountLabel(
+      importWizardData?.selectedLabel ||
+      getImportSelection()?.label ||
+      knownLabels[0]
+    ) || knownLabels[0];
+
+    const labelPrompt = prompt(
+      `Which account label should be cleaned up?\n\nAvailable labels:\n- ${knownLabels.join('\n- ')}`,
+      defaultLabel
+    );
+    if (labelPrompt === null) return;
+
+    const sourceLabel = normalizeAccountLabel(labelPrompt);
+    if (!sourceLabel) {
+      throw new Error('Please enter a valid account label');
+    }
+
+    const sourceChats = allChats.filter(
+      (chat) => normalizeAccountLabel(chat?.accountLabel) === sourceLabel
+    );
+    const hasSourceProfile = allProfiles.some(
+      (profile) => normalizeAccountLabel(profile?.accountLabel) === sourceLabel
+    );
+    const hasSourceBinding = !!bindings[sourceLabel];
+
+    if (!sourceChats.length && !hasSourceProfile && !hasSourceBinding) {
+      setStatus(`No local archived data found for "${sourceLabel}"`);
+      return;
+    }
+
+    const proceed = confirm(
+      `Remove local data for "${sourceLabel}"?\n\n` +
+      `Chats: ${sourceChats.length}\n` +
+      `Profile: ${hasSourceProfile ? 'yes' : 'no'}\n` +
+      `Label binding: ${hasSourceBinding ? 'yes' : 'no'}\n\n` +
+      'Backup warning: make a backup copy of your archive TXT/folder first.\n\n' +
+      'This only removes local archive data. It does not delete anything from ChatGPT servers.'
+    );
+    if (!proceed) return;
+
+    importInProgress = true;
+    updateImportWizardUi();
+    try {
+      const totalSteps =
+        sourceChats.length +
+        (hasSourceProfile ? 1 : 0) +
+        (hasSourceBinding ? 1 : 0) +
+        (activeAccountLabel === sourceLabel ? 1 : 0);
+      let done = 0;
+      const bump = (label) => {
+        done++;
+        const pct = totalSteps > 0 ? Math.round((done / totalSteps) * 100) : 100;
+        setProgress(pct, label);
+      };
+
+      for (let i = 0; i < sourceChats.length; i++) {
+        const chat = sourceChats[i];
+        setProgress(
+          totalSteps > 0 ? Math.round(((done + 1) / totalSteps) * 100) : 100,
+          `Removing source chats ${i + 1}/${sourceChats.length}`
+        );
+        await dbDelete(chatStorageKey(sourceLabel, chat.id));
+        done++;
+      }
+
+      if (hasSourceProfile) {
+        await dbDelete(profileStorageKey(sourceLabel));
+        bump('Removing source profile data');
+      }
+
+      if (hasSourceBinding) {
+        const nextBindings = { ...(bindings || {}) };
+        delete nextBindings[sourceLabel];
+        saveLabelBindings(nextBindings);
+        bump('Removing source label binding');
+      }
+
+      if (activeAccountLabel === sourceLabel) {
+        setActiveAccountLabel('');
+        bump('Clearing active label selection');
+      }
+
+      await rebuildArchiveFile();
+      setStatus(
+        `Storage cleanup complete for "${sourceLabel}": ` +
+        `${sourceChats.length} chats removed, profile ${hasSourceProfile ? 'removed' : 'not found'}, ` +
+        `binding ${hasSourceBinding ? 'removed' : 'not found'}`
+      );
+      setProgressDone(`Removed local account data for "${sourceLabel}"`);
+    } catch (err) {
+      setProgressFailed('Source account cleanup failed');
+      throw err;
+    } finally {
+      importInProgress = false;
+      updateImportWizardUi();
+    }
+  }
+
   async function importWizardRunAll() {
     if (importInProgress) return;
     try {
@@ -2714,6 +4359,13 @@
     } catch (err) {
       console.warn('Import wizard custom instruction step failed:', err);
       setStatus(`Custom instructions step failed: ${err?.message || err}`);
+    }
+
+    try {
+      await importWizardImportMemories();
+    } catch (err) {
+      console.warn('Import wizard memory step failed:', err);
+      setStatus(`Memory step failed: ${err?.message || err}`);
     }
 
     await importWizardImportChats();
@@ -3131,8 +4783,80 @@
       .cgpt-guide-close:active { transform: translate3d(0, 1px, 0) scale(0.98); }
       .cgpt-guide-body { padding: 14px 16px 16px; font-size: 13px; line-height: 1.45; }
       .cgpt-guide-body h3 { margin: 8px 0 8px; font-size: 14px; color: #93c5fd; }
+      .cgpt-guide-body p { margin: 0 0 10px; color: #d1d5db; }
       .cgpt-guide-body ol { margin: 0 0 12px 20px; padding: 0; }
       .cgpt-guide-body li { margin: 0 0 7px; }
+      .cgpt-guide-walkthrough {
+        margin-bottom: 14px;
+        padding: 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(59, 130, 246, 0.35);
+        background: rgba(59, 130, 246, 0.08);
+      }
+      .cgpt-guide-step-meta {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .cgpt-guide-step-counter {
+        font-size: 12px;
+        font-weight: 700;
+        color: #dbeafe;
+      }
+      .cgpt-guide-step-state {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: #9ca3af;
+      }
+      .cgpt-guide-step-state.cgpt-step-complete { color: #34d399; }
+      .cgpt-guide-step-track {
+        width: 100%;
+        height: 6px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(255,255,255,0.14);
+        margin-bottom: 10px;
+      }
+      .cgpt-guide-step-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #3b82f6, #10b981);
+        transition: width 180ms var(--cgpt-ease-fast);
+      }
+      .cgpt-guide-step-title {
+        margin: 0 0 6px;
+        font-size: 14px;
+        color: #f8fafc;
+      }
+      .cgpt-guide-step-checklist {
+        margin: 0 0 10px;
+        padding: 0 0 0 18px;
+        color: #e5e7eb;
+      }
+      .cgpt-guide-step-checklist li { margin-bottom: 5px; }
+      .cgpt-guide-step-hint {
+        margin-top: 8px;
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(0,0,0,0.18);
+        color: #d1d5db;
+        font-size: 12px;
+      }
+      .cgpt-guide-step-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        margin-top: 10px;
+      }
+      .cgpt-guide-step-actions .cgpt-btn {
+        min-width: 104px;
+      }
       .cgpt-guide-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
       .cgpt-guide-table th, .cgpt-guide-table td {
         border: 1px solid rgba(255,255,255,0.12); padding: 8px; text-align: left; vertical-align: top;
@@ -3183,6 +4907,48 @@
         margin-top: 10px; padding: 10px; border-radius: 8px;
         background: rgba(59, 130, 246, 0.14); border: 1px solid rgba(59, 130, 246, 0.35);
       }
+      .cgpt-import-warn {
+        margin-top: 8px; padding: 10px; border-radius: 8px;
+        background: rgba(245, 158, 11, 0.14); border: 1px solid rgba(245, 158, 11, 0.4);
+        color: #fde68a;
+      }
+      #cgpt-archive-settings-modal {
+        position: fixed; inset: 0; z-index: 1000002; display: none;
+        align-items: center; justify-content: center;
+        background: rgba(0, 0, 0, 0.72); padding: 16px;
+        opacity: 0; pointer-events: none;
+        transition: opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
+      }
+      .cgpt-settings-panel {
+        width: min(560px, 96vw); max-height: 88vh; overflow: auto;
+        background: #17181b; border: 1px solid rgba(255,255,255,0.16); border-radius: 14px;
+        box-shadow: 0 20px 48px rgba(0,0,0,0.55); color: #ececf1;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        transform: translate3d(0, 14px, 0) scale(0.985); opacity: 0.95;
+        transition: transform ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out), opacity ${MODAL_ANIMATION_MS}ms var(--cgpt-ease-out);
+      }
+      #cgpt-archive-settings-modal.cgpt-modal-open { opacity: 1; pointer-events: auto; }
+      #cgpt-archive-settings-modal.cgpt-modal-open .cgpt-settings-panel { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
+      .cgpt-settings-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.12);
+        position: sticky; top: 0; background: #17181b;
+      }
+      .cgpt-settings-title { font-size: 15px; font-weight: 700; }
+      .cgpt-settings-body { padding: 14px 16px 16px; font-size: 13px; line-height: 1.45; }
+      .cgpt-settings-list {
+        display: grid; grid-template-columns: 1fr; gap: 8px;
+        margin-top: 8px;
+      }
+      .cgpt-settings-item {
+        display: flex; align-items: flex-start; gap: 8px;
+        border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
+        background: rgba(255,255,255,0.03); padding: 10px;
+      }
+      .cgpt-settings-item input { margin-top: 2px; }
+      .cgpt-settings-actions {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px;
+      }
       @media (prefers-reduced-motion: reduce) {
         #cgpt-archive-wrap,
         #cgpt-archive-wrap > *,
@@ -3190,8 +4956,10 @@
         #cgpt-archive-show,
         #cgpt-archive-guide-modal,
         #cgpt-archive-import-modal,
+        #cgpt-archive-settings-modal,
         .cgpt-guide-panel,
         .cgpt-import-panel,
+        .cgpt-settings-panel,
         .cgpt-guide-close,
         #cgpt-archive-progress-fill,
         #cgpt-archive-status {
@@ -3203,9 +4971,197 @@
       @media (max-width: 780px) {
         .cgpt-import-actions { grid-template-columns: 1fr; }
         .cgpt-import-row { grid-template-columns: 1fr; gap: 6px; }
+        .cgpt-settings-actions { grid-template-columns: 1fr; }
+        .cgpt-guide-step-actions { justify-content: stretch; }
+        .cgpt-guide-step-actions .cgpt-btn { flex: 1 1 100%; }
       }
     `;
     document.head.appendChild(style);
+  }
+
+  function getGuideSteps() {
+    return [
+      {
+        id: 'set-account',
+        title: 'Set an account label',
+        body: 'Give the current login a unique label so archives stay separated across accounts.',
+        checklist: [
+          'Click Set Account.',
+          'Use labels like main, work, or personal.',
+          'Keep one label per ChatGPT login.'
+        ],
+        hint: 'You can change the label later, but keep it stable for clean history grouping.',
+        actionId: 'set-account',
+        actionLabel: 'Set Account Now'
+      },
+      {
+        id: 'choose-file',
+        title: 'Choose your archive destination',
+        body: 'Pick either a local archive .txt file or a bundle folder (or both).',
+        checklist: [
+          'Option A: Click Choose File and select/create your archive .txt file.',
+          'Option B: Click Choose Folder for bundle export output.',
+          'Grant write permission when the browser asks.'
+        ],
+        hint: 'Choose File is needed for live archive writes. Choose Folder enables bundled exports with per-chat assets.',
+        actionId: 'choose-file',
+        actionLabel: 'Choose File Now',
+        altActionId: 'choose-folder',
+        altActionLabel: 'Choose Folder Instead'
+      },
+      {
+        id: 'sync-all',
+        title: 'Run first full sync',
+        body: 'Pull your conversation list and save each chat into the archive file.',
+        checklist: [
+          'Click Sync All.',
+          'Wait for progress to finish.',
+          'Keep the tab open while the first sync runs.'
+        ],
+        hint: 'This first run can take a bit if you have many chats.',
+        actionId: 'sync-all',
+        actionLabel: 'Run Sync All'
+      },
+      {
+        id: 'sync-profile',
+        title: 'Sync profile context',
+        body: 'Capture memories, custom instructions, and About You so account context is preserved.',
+        checklist: [
+          'Click Sync Profile after setup.',
+          'Run again whenever profile details change.',
+          'Use this if memory/profile data looks stale.'
+        ],
+        hint: 'If profile data is missing, run this once while logged into the correct account.',
+        actionId: 'sync-profile',
+        actionLabel: 'Sync Profile Now'
+      },
+      {
+        id: 'daily-flow',
+        title: 'Daily archive workflow',
+        body: 'Use Save Now for the current chat, leave the tab open for auto-sync, and use Import Wizard to restore.',
+        checklist: [
+          'Click Save Now to capture only the current chat instantly.',
+          'Leave ChatGPT open so background sync can keep the archive fresh.',
+          'Open Import Wizard when you want to re-import archive content.'
+        ],
+        hint: 'You can reopen this setup anytime from the Setup Guide button.',
+        actionId: 'open-import',
+        actionLabel: 'Open Import Wizard'
+      }
+    ];
+  }
+
+  function isGuideStepComplete(stepId) {
+    switch (stepId) {
+      case 'set-account':
+        return !!activeAccountLabel;
+      case 'choose-file':
+        return !!hasArchiveFileHandle || !!hasBundleFolderHandle;
+      case 'choose-folder':
+        return !!hasBundleFolderHandle;
+      case 'sync-all':
+        return lastSyncStartedAt > 0;
+      case 'sync-profile':
+        return lastProfileSyncStartedAt > 0;
+      default:
+        return false;
+    }
+  }
+
+  function renderGuideStep() {
+    const steps = getGuideSteps();
+    guideStepIndex = Math.max(0, Math.min(steps.length - 1, guideStepIndex));
+    const step = steps[guideStepIndex];
+    if (!step) return;
+
+    const counter = document.getElementById('cgpt-guide-step-counter');
+    const state = document.getElementById('cgpt-guide-step-state');
+    const fill = document.getElementById('cgpt-guide-step-fill');
+    const title = document.getElementById('cgpt-guide-step-title');
+    const body = document.getElementById('cgpt-guide-step-body');
+    const list = document.getElementById('cgpt-guide-step-checklist');
+    const hint = document.getElementById('cgpt-guide-step-hint');
+    const actionBtn = document.getElementById('cgpt-guide-step-action');
+    const altActionBtn = document.getElementById('cgpt-guide-step-action-alt');
+    const prevBtn = document.getElementById('cgpt-guide-prev');
+    const nextBtn = document.getElementById('cgpt-guide-next');
+
+    if (counter) counter.textContent = `Step ${guideStepIndex + 1} of ${steps.length}`;
+
+    const complete = isGuideStepComplete(step.id);
+    if (state) {
+      state.textContent = complete ? 'Complete' : 'Pending';
+      state.classList.toggle('cgpt-step-complete', complete);
+    }
+
+    if (fill) fill.style.width = `${Math.round(((guideStepIndex + 1) / steps.length) * 100)}%`;
+    if (title) title.textContent = step.title;
+    if (body) body.textContent = step.body;
+    if (hint) hint.textContent = step.hint || '';
+
+    if (list) {
+      list.innerHTML = '';
+      for (const item of step.checklist || []) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        list.appendChild(li);
+      }
+    }
+
+    if (actionBtn) {
+      if (step.actionId) {
+        actionBtn.style.display = '';
+        actionBtn.textContent = step.actionLabel || 'Do This Step';
+      } else {
+        actionBtn.style.display = 'none';
+      }
+    }
+    if (altActionBtn) {
+      if (step.altActionId) {
+        altActionBtn.style.display = '';
+        altActionBtn.textContent = step.altActionLabel || 'Alternative Option';
+      } else {
+        altActionBtn.style.display = 'none';
+      }
+    }
+
+    if (prevBtn) prevBtn.disabled = guideStepIndex === 0;
+    if (nextBtn) nextBtn.textContent = guideStepIndex >= steps.length - 1 ? 'Finish' : 'Next';
+  }
+
+  async function runGuideStepAction(actionOverride = '') {
+    const step = getGuideSteps()[guideStepIndex];
+    const actionId = cleanText(actionOverride || step?.actionId || '');
+    if (!actionId) return;
+
+    try {
+      if (actionId === 'set-account') {
+        await promptForAccountLabel();
+      } else if (actionId === 'choose-file') {
+        setProgress(0, 'Choosing archive file...', { indeterminate: true });
+        await chooseArchiveFile();
+        await rebuildArchiveFile();
+        setProgressDone('Archive file ready');
+      } else if (actionId === 'choose-folder') {
+        setProgress(0, 'Choosing bundle folder...', { indeterminate: true });
+        await chooseArchiveBundleFolder();
+        setProgressDone('Bundle folder ready');
+      } else if (actionId === 'sync-all') {
+        await syncAllChatsForActiveAccount({ silent: false });
+      } else if (actionId === 'sync-profile') {
+        await syncAccountProfileForActiveAccount({ silent: false, force: true });
+      } else if (actionId === 'open-import') {
+        closeGuideModal();
+        openImportWizardModal();
+        return;
+      }
+    } catch (err) {
+      const message = err?.message || String(err);
+      setStatus(`Setup step failed: ${message}`);
+      setProgressFailed('Setup step failed');
+    } finally {
+      renderGuideStep();
+    }
   }
 
   function closeGuideModal() {
@@ -3220,41 +5176,53 @@
     modal = document.createElement('div');
     modal.id = 'cgpt-archive-guide-modal';
     modal.innerHTML = `
-      <div class="cgpt-guide-panel" role="dialog" aria-modal="true" aria-label="Archive guide">
+      <div class="cgpt-guide-panel" role="dialog" aria-modal="true" aria-label="Archive setup guide">
         <div class="cgpt-guide-head">
-          <div class="cgpt-guide-title">Archive Manager Guide</div>
+          <div class="cgpt-guide-title">First-Time Archive Setup</div>
           <button class="cgpt-guide-close" data-guide-close="1">Close</button>
         </div>
         <div class="cgpt-guide-body">
-          <h3>Step-by-step setup</h3>
-          <ol>
-            <li>Open ChatGPT and log into the account you want to archive.</li>
-            <li>Click <b>Set Account</b> and enter a unique label per account like <code>main</code> or <code>work</code>.</li>
-            <li>Click <b>Choose File</b> and pick your archive <code>.txt</code> file.</li>
-            <li>Click <b>Sync All</b> to pull all chats plus account profile data.</li>
-            <li>Click <b>Sync Profile</b> any time you want to force-refresh memories/custom instructions/About You.</li>
-            <li>Leave the tab open and the script keeps auto-syncing in the background.</li>
-          </ol>
+          <div class="cgpt-guide-walkthrough">
+            <div class="cgpt-guide-step-meta">
+              <div class="cgpt-guide-step-counter" id="cgpt-guide-step-counter"></div>
+              <div class="cgpt-guide-step-state" id="cgpt-guide-step-state"></div>
+            </div>
+            <div class="cgpt-guide-step-track">
+              <div class="cgpt-guide-step-fill" id="cgpt-guide-step-fill"></div>
+            </div>
+            <h3 class="cgpt-guide-step-title" id="cgpt-guide-step-title"></h3>
+            <p id="cgpt-guide-step-body"></p>
+            <ul class="cgpt-guide-step-checklist" id="cgpt-guide-step-checklist"></ul>
+            <div class="cgpt-guide-step-hint" id="cgpt-guide-step-hint"></div>
+            <div class="cgpt-guide-step-actions">
+              <button class="cgpt-btn" id="cgpt-guide-prev">Back</button>
+              <button class="cgpt-btn" id="cgpt-guide-step-action">Do This Step</button>
+              <button class="cgpt-btn" id="cgpt-guide-step-action-alt">Alternative Option</button>
+              <button class="cgpt-btn cgpt-btn-primary" id="cgpt-guide-next">Next</button>
+            </div>
+          </div>
 
-          <h3>What each button does</h3>
+          <h3>Quick button reference</h3>
           <table class="cgpt-guide-table">
             <thead>
               <tr><th>Button</th><th>Action</th></tr>
             </thead>
             <tbody>
-              <tr><td><b>Set Account</b></td><td>Sets the label for the currently logged-in ChatGPT account. Data is grouped by this label in the TXT archive.</td></tr>
-              <tr><td><b>Choose File</b></td><td>Selects the archive TXT file to read/write. Existing archive content is imported first.</td></tr>
-              <tr><td><b>Save Now</b></td><td>Captures only the currently open chat page immediately.</td></tr>
-              <tr><td><b>Sync All</b></td><td>Fetches conversation list, downloads each chat, and also syncs account profile data.</td></tr>
-              <tr><td><b>Sync Profile</b></td><td>Forces a profile refresh (custom instructions + About You + saved memories) and writes it to archive.</td></tr>
-              <tr><td><b>Hide UI</b></td><td>Hides the panel. Use the floating <b>Open Archive</b> button to show it again.</td></tr>
-              <tr><td><b>Guide</b></td><td>Opens this step-by-step help window.</td></tr>
-              <tr><td><b>Import Wizard</b></td><td>Loads an archive TXT and helps import custom instructions + chats into the current account.</td></tr>
+              <tr><td><b>Set Account</b></td><td>Sets the label for the current ChatGPT login so archive entries stay grouped correctly.</td></tr>
+              <tr><td><b>Choose File</b></td><td>Selects the archive TXT file to read and write.</td></tr>
+              <tr><td><b>Choose Folder</b></td><td>Selects an export folder for bundle output.</td></tr>
+              <tr><td><b>Export Bundle</b></td><td>Writes <code>archive.txt</code>, global indexes, and per-chat folders with sources/code plus automatic media/file download attempts.</td></tr>
+              <tr><td><b>Save Now</b></td><td>Saves the currently open chat immediately.</td></tr>
+              <tr><td><b>Sync All</b></td><td>Runs a full chat + profile sync sweep for the active account label.</td></tr>
+              <tr><td><b>Sync Profile</b></td><td>Refreshes memories, custom instructions, and About You in the archive.</td></tr>
+              <tr><td><b>Import Wizard</b></td><td>Loads archive data and helps import it into the currently logged-in account.</td></tr>
+              <tr><td><b>Settings</b></td><td>Controls bundle export toggles (sources/media/code/files and automatic downloads).</td></tr>
+              <tr><td><b>Setup Guide</b></td><td>Reopens this first-time step-by-step setup walkthrough.</td></tr>
+              <tr><td><b>Hide UI</b></td><td>Hides this panel. Use <b>Open Archive</b> to show it again.</td></tr>
             </tbody>
           </table>
-
           <div class="cgpt-guide-note">
-            Tip: If memories/custom instructions/About You are not showing yet, click <b>Sync Profile</b> once while logged into the correct account.
+            Tip: For first setup, run in order: Set Account -> Choose File or Choose Folder -> Sync All.
           </div>
         </div>
       </div>
@@ -3270,6 +5238,51 @@
       btn.addEventListener('click', () => closeGuideModal());
     });
 
+    const prevBtn = modal.querySelector('#cgpt-guide-prev');
+    const nextBtn = modal.querySelector('#cgpt-guide-next');
+    const actionBtn = modal.querySelector('#cgpt-guide-step-action');
+    const altActionBtn = modal.querySelector('#cgpt-guide-step-action-alt');
+
+    if (prevBtn) {
+      prevBtn.addEventListener('click', () => {
+        guideStepIndex = Math.max(0, guideStepIndex - 1);
+        renderGuideStep();
+      });
+    }
+    if (nextBtn) {
+      nextBtn.addEventListener('click', () => {
+        const last = getGuideSteps().length - 1;
+        if (guideStepIndex >= last) {
+          closeGuideModal();
+          return;
+        }
+        guideStepIndex = Math.min(last, guideStepIndex + 1);
+        renderGuideStep();
+      });
+    }
+    if (actionBtn) {
+      actionBtn.addEventListener('click', async () => {
+        actionBtn.disabled = true;
+        try {
+          await runGuideStepAction();
+        } finally {
+          actionBtn.disabled = false;
+        }
+      });
+    }
+    if (altActionBtn) {
+      altActionBtn.addEventListener('click', async () => {
+        const step = getGuideSteps()[guideStepIndex];
+        if (!step?.altActionId) return;
+        altActionBtn.disabled = true;
+        try {
+          await runGuideStepAction(step.altActionId);
+        } finally {
+          altActionBtn.disabled = false;
+        }
+      });
+    }
+
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         closeGuideModal();
@@ -3280,8 +5293,129 @@
     return modal;
   }
 
-  function openGuideModal() {
+  function openGuideModal(startStep = 0) {
+    const steps = getGuideSteps();
+    guideStepIndex = Math.max(0, Math.min(steps.length - 1, Number(startStep) || 0));
     const modal = ensureGuideModal();
+    renderGuideStep();
+    setModalVisibility(modal, true);
+  }
+
+  function closeSettingsModal() {
+    const modal = document.getElementById('cgpt-archive-settings-modal');
+    setModalVisibility(modal, false);
+  }
+
+  function updateSettingsModalControls() {
+    const modal = document.getElementById('cgpt-archive-settings-modal');
+    if (!modal) return;
+    const settings = getExportSettings();
+    const setChecked = (id, checked) => {
+      const el = modal.querySelector(`#${id}`);
+      if (el) el.checked = !!checked;
+    };
+    setChecked('cgpt-settings-include-sources', settings.includeSources);
+    setChecked('cgpt-settings-include-media', settings.includeMedia);
+    setChecked('cgpt-settings-include-code', settings.includeCode);
+    setChecked('cgpt-settings-include-files', settings.includeFiles);
+    setChecked('cgpt-settings-auto-download', settings.autoDownloadAssets);
+  }
+
+  function ensureSettingsModal() {
+    let modal = document.getElementById('cgpt-archive-settings-modal');
+    if (modal) return modal;
+
+    modal = document.createElement('div');
+    modal.id = 'cgpt-archive-settings-modal';
+    modal.innerHTML = `
+      <div class="cgpt-settings-panel" role="dialog" aria-modal="true" aria-label="Archive settings">
+        <div class="cgpt-settings-head">
+          <div class="cgpt-settings-title">Archive Settings</div>
+          <button class="cgpt-guide-close" data-settings-close="1">Close</button>
+        </div>
+        <div class="cgpt-settings-body">
+          <div>Control what bundle export writes/downloads.</div>
+          <div class="cgpt-settings-list">
+            <label class="cgpt-settings-item">
+              <input type="checkbox" id="cgpt-settings-include-sources" />
+              <div><b>Include Sources</b><br/>Write global + per-chat source lists.</div>
+            </label>
+            <label class="cgpt-settings-item">
+              <input type="checkbox" id="cgpt-settings-include-media" />
+              <div><b>Include Media</b><br/>Write media indexes and chat media folders.</div>
+            </label>
+            <label class="cgpt-settings-item">
+              <input type="checkbox" id="cgpt-settings-include-code" />
+              <div><b>Include Code</b><br/>Write global + per-chat code snippet files.</div>
+            </label>
+            <label class="cgpt-settings-item">
+              <input type="checkbox" id="cgpt-settings-include-files" />
+              <div><b>Include Files</b><br/>Write file indexes and chat file folders.</div>
+            </label>
+            <label class="cgpt-settings-item">
+              <input type="checkbox" id="cgpt-settings-auto-download" />
+              <div><b>Auto-download Assets</b><br/>Automatically download media/files during Export Bundle.</div>
+            </label>
+          </div>
+          <div class="cgpt-settings-actions">
+            <button class="cgpt-btn" id="cgpt-settings-reset">Reset Defaults</button>
+            <button class="cgpt-btn cgpt-btn-primary" id="cgpt-settings-save">Save Settings</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) {
+        closeSettingsModal();
+      }
+    });
+
+    modal.querySelectorAll('[data-settings-close]').forEach((btn) => {
+      btn.addEventListener('click', () => closeSettingsModal());
+    });
+
+    const saveBtn = modal.querySelector('#cgpt-settings-save');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => {
+        const readChecked = (id) => {
+          const el = modal.querySelector(`#${id}`);
+          return !!el?.checked;
+        };
+        saveExportSettings({
+          includeSources: readChecked('cgpt-settings-include-sources'),
+          includeMedia: readChecked('cgpt-settings-include-media'),
+          includeCode: readChecked('cgpt-settings-include-code'),
+          includeFiles: readChecked('cgpt-settings-include-files'),
+          autoDownloadAssets: readChecked('cgpt-settings-auto-download')
+        });
+        setStatus('Export settings saved');
+        closeSettingsModal();
+      });
+    }
+
+    const resetBtn = modal.querySelector('#cgpt-settings-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        saveExportSettings(getDefaultExportSettings());
+        updateSettingsModalControls();
+        setStatus('Export settings reset to defaults');
+      });
+    }
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeSettingsModal();
+      }
+    });
+
+    document.body.appendChild(modal);
+    return modal;
+  }
+
+  function openSettingsModal() {
+    const modal = ensureSettingsModal();
+    updateSettingsModalControls();
     setModalVisibility(modal, true);
   }
 
@@ -3320,15 +5454,29 @@
           <div class="cgpt-import-actions">
             <button class="cgpt-btn" id="cgpt-import-load-file">Load Archive TXT</button>
             <button class="cgpt-btn" id="cgpt-import-apply-ci" disabled>Apply Custom Instructions</button>
-            <button class="cgpt-btn" id="cgpt-import-import-chats" disabled>Import Chats</button>
+            <button class="cgpt-btn" id="cgpt-import-import-memories" disabled>Import Memories</button>
           </div>
           <div class="cgpt-import-actions">
+            <button class="cgpt-btn" id="cgpt-import-import-chats" disabled>Import Chats (One Thread)</button>
+            <button class="cgpt-btn" id="cgpt-import-import-chats-separate" disabled>Import Chats (Separate Threads)</button>
             <button class="cgpt-btn cgpt-btn-primary" id="cgpt-import-run-all" disabled>Run Import All</button>
+          </div>
+          <div class="cgpt-import-actions">
+            <button class="cgpt-btn cgpt-btn-danger" id="cgpt-import-cleanup-source-chats" disabled>Remove Source Account Data (Save Space)</button>
           </div>
 
           <div class="cgpt-import-summary" id="cgpt-import-summary">Load an archive TXT to begin.</div>
           <div class="cgpt-import-hint">
-            Import Chats sends archive chunks into the currently open chat thread in this account.
+            Import Memories uses API calls when available. One-thread mode sends all imported chats into the current thread; separate-thread mode opens one new chat per archived chat.
+          </div>
+          <div class="cgpt-import-hint">
+            Need less local storage after migration? Use <b>Remove Source Account Data (Save Space)</b> to remove prior account chats, profile, and label binding from this local archive.
+          </div>
+          <div class="cgpt-import-warn">
+            Backup warning: make a backup copy of your archive TXT/folder before removing source account data.
+          </div>
+          <div class="cgpt-import-warn">
+            Warning: chat import can take a moment (or several minutes for large archives). Keep this tab open until it finishes.
           </div>
         </div>
       </div>
@@ -3376,6 +5524,17 @@
       });
     }
 
+    const importMemoriesBtn = modal.querySelector('#cgpt-import-import-memories');
+    if (importMemoriesBtn) {
+      importMemoriesBtn.addEventListener('click', async () => {
+        try {
+          await importWizardImportMemories();
+        } catch (err) {
+          setStatus(`Memory import failed: ${err?.message || err}`);
+        }
+      });
+    }
+
     const importBtn = modal.querySelector('#cgpt-import-import-chats');
     if (importBtn) {
       importBtn.addEventListener('click', async () => {
@@ -3383,6 +5542,28 @@
           await importWizardImportChats();
         } catch (err) {
           setStatus(`Chat import failed: ${err?.message || err}`);
+        }
+      });
+    }
+
+    const importSeparateBtn = modal.querySelector('#cgpt-import-import-chats-separate');
+    if (importSeparateBtn) {
+      importSeparateBtn.addEventListener('click', async () => {
+        try {
+          await importWizardImportChatsSeparateThreads();
+        } catch (err) {
+          setStatus(`Separate-thread import failed: ${err?.message || err}`);
+        }
+      });
+    }
+
+    const cleanupSourceBtn = modal.querySelector('#cgpt-import-cleanup-source-chats');
+    if (cleanupSourceBtn) {
+      cleanupSourceBtn.addEventListener('click', async () => {
+        try {
+          await importWizardPurgeSourceChats();
+        } catch (err) {
+          setStatus(`Source account cleanup failed: ${err?.message || err}`);
         }
       });
     }
@@ -3462,6 +5643,28 @@
     row1.appendChild(setAccountBtn);
     row1.appendChild(chooseFileBtn);
 
+    const row1b = document.createElement('div');
+    row1b.className = 'cgpt-btn-row';
+    const chooseFolderBtn = createBtn('Choose Folder', async () => {
+      setProgress(0, 'Choosing bundle folder...', { indeterminate: true });
+      try {
+        await chooseArchiveBundleFolder();
+        setProgressDone('Bundle folder ready');
+      } catch (err) {
+        setStatus('Could not choose folder');
+        setProgressFailed('Choose folder failed');
+      }
+    });
+    const exportBundleBtn = createBtn('Export Bundle', async () => {
+      try {
+        await exportArchiveBundleToFolder();
+      } catch (err) {
+        setStatus(`Bundle export failed: ${err?.message || err}`);
+      }
+    }, 'cgpt-btn-primary');
+    row1b.appendChild(chooseFolderBtn);
+    row1b.appendChild(exportBundleBtn);
+
     const row2 = document.createElement('div');
     row2.className = 'cgpt-btn-row';
     const saveBtn = createBtn('Save Now', async () => {
@@ -3481,21 +5684,29 @@
     row2.appendChild(syncAllBtn);
 
     const row3 = document.createElement('div');
-    row3.className = 'cgpt-btn-row';
+    row3.className = 'cgpt-btn-row-single';
     const syncProfileBtn = createBtn('Sync Profile', async () => {
       try { await syncAccountProfileForActiveAccount({ silent: false, force: true }); }
       catch (err) { setStatus('Profile sync failed'); }
     });
-    const hideBtn = createBtn('Hide UI', () => setUiHidden(true), 'cgpt-btn-danger');
     row3.appendChild(syncProfileBtn);
-    row3.appendChild(hideBtn);
 
     const row4 = document.createElement('div');
     row4.className = 'cgpt-btn-row';
     const importWizardBtn = createBtn('Import Wizard', () => openImportWizardModal());
-    const guideBtn = createBtn('Guide', () => openGuideModal());
+    const settingsBtn = createBtn('Settings', () => openSettingsModal());
     row4.appendChild(importWizardBtn);
-    row4.appendChild(guideBtn);
+    row4.appendChild(settingsBtn);
+
+    const row5 = document.createElement('div');
+    row5.className = 'cgpt-btn-row-single';
+    const guideBtn = createBtn('Setup Guide', () => openGuideModal(0));
+    row5.appendChild(guideBtn);
+
+    const row6 = document.createElement('div');
+    row6.className = 'cgpt-btn-row-single';
+    const hideBtn = createBtn('Hide UI', () => setUiHidden(true), 'cgpt-btn-danger');
+    row6.appendChild(hideBtn);
 
     const status = document.createElement('div');
     status.id = 'cgpt-archive-status';
@@ -3512,9 +5723,12 @@
 
     wrap.appendChild(header);
     wrap.appendChild(row1);
+    wrap.appendChild(row1b);
     wrap.appendChild(row2);
     wrap.appendChild(row3);
     wrap.appendChild(row4);
+    wrap.appendChild(row5);
+    wrap.appendChild(row6);
     wrap.appendChild(progress);
     wrap.appendChild(status);
 
@@ -3522,6 +5736,7 @@
     document.body.appendChild(wrap);
     ensureGuideModal();
     ensureImportWizardModal();
+    ensureSettingsModal();
 
     updateAccountBadge();
     updateUiVisibility();
@@ -3546,6 +5761,9 @@
     startAutoSyncLoop();
 
     const handle = await getSavedFileHandle();
+    hasArchiveFileHandle = !!handle;
+    const bundleFolderHandle = await getSavedBundleFolderHandle();
+    hasBundleFolderHandle = !!bundleFolderHandle;
     await maybeImportArchiveFromFile(handle);
     const persistedAccountLabel = getPersistedAccountLabel();
     if (persistedAccountLabel) {
@@ -3555,6 +5773,17 @@
       setStatus('Set account label first');
     } else {
       setStatus('Choose archive file + set account label');
+    }
+
+    try {
+      if (!localStorage.getItem(SETUP_SHOWN_KEY)) {
+        localStorage.setItem(SETUP_SHOWN_KEY, '1');
+        setTimeout(() => {
+          openGuideModal(0);
+        }, 800);
+      }
+    } catch (e) {
+      // Ignore localStorage errors in incognito or blocked environments
     }
 
     setInterval(addUi, 2000);
