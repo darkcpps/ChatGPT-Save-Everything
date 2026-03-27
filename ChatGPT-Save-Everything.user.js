@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ChatGPT One-File Archive (Account Safe)
+// @name         ChatGPT Archive (Save Chatlogs Locally)
 // @namespace    http://tampermonkey.net/
-// @version      2.10
+// @version      2.11
 // @description  Archive ChatGPT chats and profile context into one local TXT file, with account-safe labels, auto-sync, and import tools.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
